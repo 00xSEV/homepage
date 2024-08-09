@@ -8,9 +8,10 @@ import * as Plugin from "./quartz/plugins"
  */
 const config: QuartzConfig = {
   configuration: {
-    pageTitle: "🪴 Quartz 4.0",
+    pageTitle: "00xSEV",
     enableSPA: true,
-    enablePopovers: true,
+    // until https://github.com/jackyzha0/quartz/issues/890 fixed
+    enablePopovers: false,
     analytics: {
       provider: "plausible",
     },
