@@ -1,0 +1,314 @@
+---
+title: Deep dive into Euler
+---
+
+> Best viewed in Obsidian
+https://gist.githubusercontent.com/00xSEV/6a3029e51cfea29331bd25233fc6c564/raw/0270d5a66e043b9a48f8b68de637e9a2fb89694c/euler_notes.md
+> Reviews every important function and its call trace
+## - BorrowingModule ^BorrowingModule
+  - touch -- [[#^Base-initOperation]] (update storage: accum + lastUpdated, fees, shares, borrows), set a snapshot. (After the call it will be all checked on EVC)
+    - How is a snapshot used? [[#^Base-snapshot]] 
+      - checkVaultStatus [[#^RiskManager-checkVaultStatus]]
+  - flashLoan -- get acc (msg.sender or ~msg.sender), send all the balance to acc, callback, check balance
+    - Is a nonReentrant modifier inherited? -- no, but since we do delegateCall it will be used
+      - Why no events!? -- didn't do delegate
+  - repayWithShares -- burn ~msg.sender's shares, reduce receiver's debt
+    - decreaseBorrow -- reduce user's owed, update his interestAccumulator, update totalBorrows, log
+      - vaultCache.totalBorrows > owedExact -- if totalBorrows (by all users) > borrowed by THIS user (before repay)
+      - setUserBorrow -- update both owed and interestAccumulator
+      - Owed owedRemaining = owed.subUnchecked(assets).toOwed() -- debt remaining after repay
+        - owed -- owed now, by `receiver`, rounded up to Assets
+        - assets -- user requested value, `[1, owed]`
+        - toOwed -- just add 31 0s
+      - loadUserBorrow [[#^BorrowUtils-loadUserBorrow]]
+      - When assets > owed? -- requested amount > owed. But it also checked in repayWithShares and reset to owed in this case. Probably impossible in this case, maybe in others it's possible
+        - owed in decreaseBorrow -- owed now, rounded up
+        - assets -- either all shares price, or requested amount (both rounded up)
+        - owed in repayWithShares -- same, but rerequested
+        - Can there be any updates in between owed? -- only balanceTracker, which is trusted, I assume
+          - decreaseBalance -- nope
+            - setOwed?
+            - interestAccumulator?
+    - decreaseBalance -- decrease shares balance for user (~msg.sender), decrease totalShares both storage and cache, trigger balanceForwarder hook, emit events
+      - Why account, sender, receiver are all the same? -- sender, receiver just for a withdraw event
+      - balanceTrackerHook
+        - How to add enabledRewards?
+      - getBalanceAndBalanceForwarder -- balance shares + is forwarder set
+        - unpackBalance
+        - unpackBalanceForwarder
+    - getBalance -- return shares, max = uint112.max shares, last 112 bits in the slot
+    - When assets > owed? -- user requested value
+  - repay -- transfer assets to address(this)=Vault from ~msg.sender, decrease borrow of `receiver` (custom param)
+    - pullAssets -- transfer from account to address(this)=Vault
+      - Hmm, won't it allow to pull from anyone who approved the vault? -- nope, because check for account from EVC
+      - permit2, what is it -- Uniswap contract, allows to approve in a batch, one network tx, several ops, signatures too
+        - safeTransferFrom -- try to transfer, otherwise use permit2
+          - Permit2 -- allows to approve in a batch, one network tx, several ops
+          - trySafeTransferFrom -- try transfer, but return false instead of revert
+  - borrow -- increase debt for ~msg.sender, transfer assets to a receiver
+    - increaseBorrow -- set new owed for a user + totalBorrows (cache, storage) + log
+    - pushAssets -- transferTo `to`
+      - safeTransfer(custom) -- almost standard, but does not check if contract exists
+  - pullDebt -- any user can get debt from anyone else 
+    - initOperation [[#^Base-initOperation]] 
+    - transferBorrow [[#^Borrowing-transferBorrow]]
+      - We possibly did assetsUp, can we still transfer? -- Yes, dust will be ignored 
+  - interestRate -> computeInterestRateView
+    - What's IRM? -- basically just provides the current rate. To grow interestAccumulator => totalOwed and totalBorrows 
+      - Where is the rate used? -- main: interestAccumulator grows => totalOwed; + totalBorrows 
+        - Main: on Cache update, to get multiplier, to increase interestAccumulator and totalBorrows 
+          - Where is interestAccumulator used? -- mostly to get currently owed amount, grows constantly 
+            - setUserBorrow <- increase, decrease, transfer borrow
+            - logVaultStatus <- initialize, setInterestFee, setInterestRateModel, [[#^RiskManager-checkVaultStatus]] 
+            - getCurrentOwed <-
+              - debtOf <- DToken.balanceOf <- X
+              - debtOfExact <- X
+              - repay <- X
+              - repayWithShares <- X
+              - pullDebt <- X
+              - calculateLiquidation <- ^calculateLiquidation
+                - checkLiquidation <- X
+                - liquidate <- X
+              - getLiabilityValue <- ^LiquidityUtils-getLiabilityValue
+                - accountLiquidityFull <- X
+                - calculateLiquidity <- 
+                  - calculateMaxLiquidation
+                    - calculateLiquidation [[#^calculateLiquidation]]
+                  - accountLiquidity <- X
+                - checkLiquidity <- checkAccountStatus <- EVC.*
+        - computeInterestRateView
+          - Borrowing.interestRate // no inner usages
+        - computeInterestRate -- used in checkVaultStatus (end of call/batch, in liquidation, initOperation (maybe not, maybe always deferred)), setInterestRateModel
+          - RiskManager.checkVaultStatus ^RiskManager-checkVaultStatus
+            - (related [[#^EVCcheckVaultStatus]] )
+            - EVC.checkVaultStatusInternal -- end of call/batch, in liquidation, initOperation
+              - How come it checks if not deferred in both call and initOperation? Something with context? -- yes, it saves context in `memory`, then set deferred in `storage`. So next calls will have deferred true, but current context (top-level) is not
+              - EVC.requireVaultStatusCheckInternal -- see above, in initOperation + end of call, batch, executeLiquidation
+                - EVC.requireVaultStatusCheckInternalNonReentrantChecks -- on initOperation, if not deferred 
+                  - How do we set a flag to defer? -- in the beginning of a call, batch, controlCollateral, revertBatch
+                  - How do we remove that flag? -- probably no way
+                  - EVC.requireVaultStatusCheck
+                  - EVC.requireAccountAndVaultStatusCheck
+                - EVC.checkStatusAll <- EVC.restoreExecutionContext -- end of call, batch and executeLiquidation ^EVC-checkStatusAll
+                  - EVC.call -- outside
+                  - EVC.batch -- outside
+                  - EVC.controlCollateral -- execute liquidation
+                    - EVCClient.enforceCollateralTransfer
+                      - executeLiquidation [[#^executeLiquidation]]
+              - checkStatusAllWithResult -- for batch sim
+                - batchRevert
+                  - batchSimulation 
+        - Governance.setInterestRateModel
+    - IRMLinearKink.computeInterestRateInternal -- while utilization is normal use utilization ✕ slope1, when > kink add utilizationOverKink ✕ slope2
+    - IRMSynth.computeInterestRateInternal
+      - What is a rate? -- when you borrow, how much per year you will pay in interest (at least current understanding, should get better with understanding BorrowingModule)
+      - `_computeRate` -- change rate 10%
+        - if less than 1hr passed since last update => noop
+        - if > 1hr => either increase 10% or decrease 10%, capped by max/min
+    - isVaultStatusCheckDeferred -- did we call `initOperation` => added vault (and possibly controller) to the set for deferred checks
+      - evc.isVaultStatusCheckDeferred -- vaultStatusChecks.contains(vault)
+        - Where is it added to vaultStatusChecks?
+          - requireVaultStatusCheck()//msg.sender
+            - EVCRequireStatusChecks
+              - initOperation
+          - requireAccountAndVaultStatusCheck//provided value + msg.sender
+            - Same fn, EVCRequireStatusChecks
+  - debtOf
+    - getCurrentOwed -- fresh owed + accruedInterest [[#^getCurrentOwed--howUpdated]] + [[#^c126db]]
+  - cash -- amount not borrowed, balanceOf(vault)
+  - totalBorrows -- self-explanatory name, round up
+    - loadVault -- just [[#^initVaultCache]]
+    - nonReentrantView -- if reentrancyLocked allow only hookTarget calls
+      - useViewCaller? -- a mechanism that sets caller to calldata, adds to the end
+        - Where are the last 20 bytes set? -- useView => delegateToModuleView
+          - viewDelegate -- workaround to delegatecall a view function. strips `[selector 4B][module address 32B][original selector 4B][customData 32B][caller address 20B]`
+            - let size := sub(calldatasize(), 36). Why 36? -- selector + module address, leave only real calldata
+
+## - LiquidationModule.liquidate -- basically what's said in `executeLiquidation`: "transfer debt, then collateral. Possibly forgive bad debt" ^LiquidationModule-liquidate
+  - Base.initOperation - prepare cache + update storage, get account, check hook, set deferred checks ^Base-initOperation
+    - snapshotInitialized - flag that says that we need to do checks of borrowCap and supplyCap on checkVaultStatus ^Base-snapshot
+      - What kind of checks? -- borrows < cap or < prev, same for supply
+        - What's onlyEVCChecks -- basically allowed only during a certain evc state, checks in progress, several possible reasons, including restoreExecutionContext
+          - [ ] areChecksInProgress? -- skipped, don't want to go too deep rn
+            - [ ] set in restoreExecutionContext and nonReentrantChecksAcquireLock
+      - set to true in initOp
+      - set to false in checkVaultStatus, called by EVC on vault status check
+    - EVCRequireStatusChecks -- adds vault and account to sets, that will be checked in the end of EVC.call ^evcCallDeferred
+      - requireVaultStatusCheck -- adds to a set that will be checked in the end of a `call`
+        - areChecksDeferred in case of liquidation? -- yes, because it's called through EVC
+      - requireAccountAndVaultStatusCheck -- also adds to sets account and vault(msg.sender)
+      - What's accountToCheck? -- caller, none, from
+      - What's CHECKACCOUNT_CALLER? -- special variable that says that we need to check caller instead of accountToCheck
+    - callHook -- just call the hook if set for OP
+      - invokeHookTarget -- just call the hook with msg.data (all calldata, including msg.sig)
+        - What is a hook for? Just to check if reverts? -- yes
+      - How operations work? -- bitwise map
+      - How hookedOps are set -- by governor, set one target for all operations 
+    - EVCAuthenticateDeferred -- get caller from EVC
+      - getCurrentOnBehalfOfAccount
+    - Cache.updateVault -- initVaultCache (below), but then write to storage ^updateVault
+      - Cache.initVaultCache -- load vault from storage to memory; update totalBorrow, interest, totalShares and fees ^initVaultCache
+        - resolve -- last 6 bits is the power (max 63), first 10 bits/100 is mantissa, 0-10. {0.0-1.0}^{0-63}
+          - amountCap & 63 -- last 6 bits
+          - Why divided by 100? -- probably because they want it to be <1, and 1023 is a max value
+            - scale factor, but why? maybe because when we 
+          - set by government only
+        - if (feeAssets != 0) -- update newTotalShares and newAccumulatedFees
+          - vaultCache.cash -- balanceOf vault (but of course it's written on every op)
+          - OwedLib.toAssetsUpUint(newTotalBorrows) -- just round up and /1e31
+        - feeAssets = borrow grow diff x fee
+          - How is an interestFee set? -- is it really 35 shift precision// Yep
+        - What is happening inside unchecked -- update `newInterestAccumulator` and `newTotalBorrows` if not overflow
+          - What is happening in `if(!overflow)` -- update newInterestAccumulator, unless overflows
+          - What do we do when overflow? -- use the old one
+          - newTotalBorrows = intermediate / vaultCache.interestAccumulator
+        - What's rpow? `(x / 1e27)**n * 1e27` (x^n with 1e27 precision)
+        - ProxyUtils.metadata() -- just returns last 3 addresses from calldata, added by proxy
+          - Isn't anyone can pass any data? -- Yes, but it should be fine, because we only read the first bytes in solidity, and last bytes in the end
+            - But it means that if we pass only one parameter solidity will see 60 more bytes in the end (maybe if call in a loop or something?) Later
+            - How does proxy work? -- adds metadata to the end of every call
+            - What is the order of modifiers? -- From left to right? Yep
+              ```
+              modifier callThroughEVC() {
+                if (msg.sender == address(evc)) {
+                  use(MODULE_LIQUIDATION);
+                } else {
+                  callThroughEVCInternal();
+                }
+              }
+              ```
+              `callThroughEVC` -> `callThroughEVCInternal` => 
+              EVC.call =>
+              `use(MODULE_LIQUIDATION)` -> Liquidation.liquidation
+            - Does callThroughEVCInternal add the calldata 3 addresses in the end?
+              - No, it's added by calling a proxy
+            - What if we call EVC.call or something, will it also add calldata? -- No, it's not a proxy. But when it calls a proxy, calldata is added automatically in the end before delegatecall
+            - [x] diff between metaproxy and beacon proxy, I remember it was some bug about it, when can initialize beacon or something, so the calls go to another address
+  - LiquidationModule.calculateLiquidation -- check collateral, controller, coolOff. Calculate repay(debt)/yield(col.) capped by desiredRepay (must be also < maxRepay (debt))
+    - How does desiredRepay work? -- revert if > max, scale yield(collateral) otherwise
+    - calculateMaxLiquidation -- max 1 collateral received for a given debt, all scaled depending on balance, not necessarily full debt or collateral
+      - Summary: request all collateral and debt, calculate discountFactor (the more underwater, the bigger the discount), depending on 1 collateral value and debt calculate how much max can repay to get yieldBalance of collateral
+      - liqCache.repay -- amount debt to repay max, no more than 1 collateral value
+      - yieldBalance -- amount collateral to receive max, no more than debt
+      - maxRepayValue, maxYieldValue? -- max liability to cover (either all or scaled to collateral), max collateral to get (either all or scaled to liability)
+      - Is collateral always a vault? -- yes! If liquidation is enabled
+      - getQuote works with shares alright? -- should be alright if they use Router
+        - Do they use a router?
+          - Read readme
+      - What's collateralBalance -- balanceOf shares for the violator
+        - How is it used?
+          - If it's not always a vault, how can we seize it then? -- we can't, unless a violator is a vault
+            - Maybe it gives full approve when adding the tokens? -- no, we want it to be a vault
+            - Who is a violator? -- just address
+            - is it always a vault? -- no!
+              - How is targetTimestamp set (it is checked to make sure collateral is allowed)? -- in setLTV
+        - Does balanceOf return shares? -- yes
+        - What's liqCache.collateral -- collateral to be seized, checked to be a valid one
+      - What's discountFactor? -- 1 - discount, so factor is 90% for 10% discount
+        - minDiscountFactor? -- 1 - maxLiquidationDiscount
+          - What's maxLiquidationDiscount? -- max discount on liquidated guy's collateral
+            - What's the default value? -- maybe 11% in tests
+      - calculateLiquidity -- collateral, liability in UoA
+        - getLiabilityValue -- return owed+interest in unitOfAccount
+          - Is collateral also in unitOfAccount? -- yes
+          - if (address(vaultCache.asset) == vaultCache.unitOfAccount) { -- if accounting is in asset's prices
+            - unitOfAccount is? -- a coin we use as base (USDC, USDT, ETH)
+          - getCurrentOwed -- owed + accrued interest [[#^c126db]]
+            - `vaultStorage.users[account].getOwed()` -- changes on borrow
+              - interestAccumulator for user [[#^a6613d]]
+              - Why in initVaultCache it uses time and saves totalBorrows, can't it get out of sync? -- probably not on the first glance, but I may check later
+              - Where did I see a similar mechanism, but with an accumulator and time update on change? -- Because here it does not change it seems -- initVaultCache
+              - Changes on borrow change
+              - Owed amount
+        - getCollateralValue -- if no ltv or balance return 0, otherwise ask oracle the price adjusted by ltv
+          - oracle.getQuote -- either ask an oracle directly (through adapter) or use router first
+            - How does the oracle work? -- finds an oracle to ask, then asks
+              - I don't understand, what kind of oracle will be used if there are several collaterals? -- probably router, no other way around
+              - [x] Watch the video?
+          - !Why do we use balanceOf -- in docs yes, but I see no checks 
+            - !is collateral always vault? -- in docs yes, but I see no checks
+          - LTVUtils.getLTV -- return LTV using ramping formula
+            - LTVConfig.getLTV -- return LTV using ramping formula
+              - What's borrowLTV -- loan to value you need on borrow
+              - What is self.liquidationLTV and self.initialLiquidationLTV? -- current and previous LTVs, needed in case of ramp period
+              - self.targetTimestamp -- how is it set? -- when new LTV is set by the governor, now + rampDuration
+              - How LTVConfig param is set? -- `ltvLookup[collateral]`, which is set by governor
+                - How `vaultStorage.ltvLookup[collateral]` is set? -- setLTV is called by governor
+    - EVC.getCollaterals -- get vaults added as collaterals by the user
+      - EVC.accountCollaterals -- vaults, can be added and removed by user, on add/remove checks controller's status
+    - getCurrentOwed -- owed + accrued interest ^c126db
+      - `vaultStorage.users[account].interestAccumulator` -- on each borrow update it's updated. And nowhere else ^a6613d
+        - setUserBorrow -- from cache
+  - LiquidationModule.executeLiquidation -- transfer debt, then collateral. Possibly forgive bad debt (no collateral + flag + liability left) ^executeLiquidation
+    - liqCache.liability > liqCache.repay -- not all paid
+      - liability -- owed + interest = owedRightNow
+      - repay -- real repay
+    - CFG_DONT_SOCIALIZE_DEBT usage -- only for socializing debt in one place
+    - enforceCollateralTransfer -- transfer collateral from `violator` to `liquidator` (use impersonation on EVC)
+      - controlCollateral -- call target onBehalfOfAccount with data
+        - notice -- check controller is calling, check is his collateral, call collateral vault to transfer funds (impersonating violator)
+        - dev -- iiuc just says that we will either check in the end or continue if deferred
+    - forgiveAccountStatusCheck -- just removes account from checks Set in evc
+    - what's yieldBalance -- profit for liquidator
+    - transferBorrow -- allow to transfer <= than owed, but not >. Round dust. Set new owed value in `from` and `to`. Log ^Borrowing-transferBorrow
+      - logBorrow -- interest is zero, log borrow and Dtoken transfer from 0 address
+      - if (assets + toPrevAssets > toAssets) assets = toAssets - toPrevAssets; -- final: if requested > received (dust was cut), requested = diff
+        - Was interest transferred? -- it's possible, but it doesn't matter, we transfer from `from`, and we discuss `to` now
+          - Let's assume assets = 0, even so impossible
+            - Can it really be 0? -- no
+      - logRepay -- just log interest accrued, repay amt and Dtoken transfer
+        - Why InterestAccrued = debtLeft + transfer? -- see comment in logRepay or copy below
+          - // Note: on transfer: debtLeft + debtRepaid - debtWrittenOnBorrow
+            - // debtLeft = debtWrittenOnBorrow + interest - debtRepaid
+            - // if we replace debtRepaid and debtWrittenOnBorrow cancels, and we are left with interest
+        - Why assets, not amount? -- transfer assets, amount is more precise and need to be rounded anyway
+          - What's assets? -- just values passed to the fn
+          - What's amount? -- more precise assets, possibly a little more or a little less because dust is added/removed. E.g. assets = 100, amt = 100.1 or 99.9
+          - Where do we make an actual transfer? -- setUserBorrow, just add/remove amount
+          - So 1 wei error possible? And how?
+            - from = 200.1(round up 201), transfer 200, balance becomes 0, 1 wei lost
+        - Why toAssetsUp? -- exactly to fix the issue with rounding when we save amount=fromOwed
+        - logDToken -- emit transfer event on diff, from/to address(0)
+          - How is it deployed? -- in initialize
+          - calculateDTokenAddress -- basically it expects that DToken was deployed from this contract with nonce 1, and then calculates using rlp encoding, and kind of gas efficient
+            - Find CREATE3 explainer
+              - https://0xmacintosh.ca/docs/skill/blockchain/ethereum/contract-creation/ + https://ethereum.org/en/developers/docs/data-structures-and-encoding/rlp/ + remix
+      - setUserBorrow -- update owed to debtLeftUnpaid, update interestAccumulator ^BorrowUtils-setUserBorrow
+      - fromOwed = fromOwed.subUnchecked(amount); -- debtLeftUnpaid
+      - First if -- if diff(amt(repay), fromOwed(violatorDebt)) < dust consider them equal
+        - Is owedByViolator scaled? or just assets -- just assets
+        - `(amount > fromOwed && amount.subUnchecked(fromOwed).isDust())` -- diff < dust
+          - isDust -- < (1<<31) => would be cut in case of shift back to assets
+          - What is amount? -- = liqCache.repay -- debt that will be repaid
+          - What is fromOwed? -- how much is owed now, in Owed assets
+            - How is it different from .liability? -- liability is rounded up, and it's in assets, this one is exact, in Owed (more precise) but overall is the same
+              - Why round up? -- transform from Owed
+          - Is amount rounded? -- no
+          - Is fromOwed rounded? -- no
+      - loadUserBorrow -- load prevOwed (on borrow ops), getCurrentOwed (is freshly calculated) ^BorrowUtils-loadUserBorrow
+        - Why prevOwed and getCurrentOwed is different? -- prevOwed on borrow ops, getCurrentOwed is freshly calculated 
+          - How `vaultStorage.users[account]` owed updated? -- using setUserBorrow => increase, decrease, transfer borrow
+          - How getCurrentOwed updated? -- owed on borrow + accrued interest (diff between current accum and on last borrow) ^getCurrentOwed--howUpdated
+            - How Cache.interestAccumulator updated? -- depending on time passed grow accordingly, depending on interestRate (set in storage)
+              - Is it always updated before getCurrentOwed is called? -- yes
+                - [ ] debtOf -- loadVault is called inside, +
+                - debtOfExact -- loadVault is called inside, +
+                - repay -- initOperation <= updateVualt is called, +
+                - repayWithShares -- initOperation <= updateVualt is called, +
+                - pullDebt -- initOperation <= updateVualt is called, +
+                - calculateLiquidation -- initOperation <= updateVualt is called, +
+                - loadUserBorrow
+                  - increaseBorrow -- initOperation <= updateVualt is called, +
+                  - decreaseBorrow -- initOperation <= updateVualt is called, +
+                  - transferBorrow -- initOperation <= updateVualt is called, +
+                - getLiabilityValue, +
+              - How is interestRate updated? -- computeInterestRate -- on setInterestRateModel (governor), checkVaultStatus
+        - getOwed -- unpack owed: use a mask on slot, cut the unused last 112 bits
+        - getCurrentOwed -- freshly calculated
+        - Does borrow ops update the accumulator with fresh rate on save? -- yes, all incr, decr, transfer
+      - How are violator, liquidator set?
+        - violator -- passed as param
+        - liquidator -- from initOperation, should be handled by EVC
+      - toOwed how does it work? -- basically just scale <<31
+        - [x] Why << INTERNAL_DEBT_PRECISION_SHIFT?
+          - Why not 32? -- I think just to have some gap, it's not that important I guess
