@@ -2,8 +2,8 @@
 title: Deep dive into Euler
 ---
 
-> Best viewed in Obsidian
-https://gist.githubusercontent.com/00xSEV/6a3029e51cfea29331bd25233fc6c564/raw/0270d5a66e043b9a48f8b68de637e9a2fb89694c/euler_notes.md
+> Best viewed in Obsidian. [.md file](https://gist.githubusercontent.com/00xSEV/6a3029e51cfea29331bd25233fc6c564/raw/0270d5a66e043b9a48f8b68de637e9a2fb89694c/euler_notes.md)
+
 > Reviews every important function and its call trace
 ## - BorrowingModule ^BorrowingModule
   - touch -- [[#^Base-initOperation]] (update storage: accum + lastUpdated, fees, shares, borrows), set a snapshot. (After the call it will be all checked on EVC)
