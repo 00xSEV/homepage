@@ -128,13 +128,14 @@ const calloutLineRegex = new RegExp(/^> *\[\!\w+\|?.*?\][+-]?.*$/gm)
 const tagRegex = new RegExp(
   /(?:^| )#((?:[-_\p{L}\p{Emoji}\p{M}\d])+(?:\/[-_\p{L}\p{Emoji}\p{M}\d]+)*)/gu,
 )
-const blockReferenceRegex = new RegExp(/\^([-_A-Za-z0-9]+)$/g)
+const blockReferenceRegex = new RegExp(/\^([-_—A-Za-z0-9]+)(?=\n?$)/g)
 const ytLinkRegex = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|\&v=)([^#\&\?]*).*/
 const ytPlaylistLinkRegex = /[?&]list=([^#?&]*)/
 const videoExtensionRegex = new RegExp(/\.(mp4|webm|ogg|avi|mov|flv|wmv|mkv|mpg|mpeg|3gp|m4v)$/)
 const wikilinkImageEmbedRegex = new RegExp(
   /^(?<alt>(?!^\d*x?\d*$).*?)?(\|?\s*?(?<width>\d+)(x(?<height>\d+))?)?$/,
 )
+const BLOCK_LINK_PREFIX = "__"
 
 export const ObsidianFlavoredMarkdown: QuartzTransformerPlugin<Partial<Options>> = (userOpts) => {
   const opts = { ...defaultOptions, ...userOpts }
@@ -193,7 +194,7 @@ export const ObsidianFlavoredMarkdown: QuartzTransformerPlugin<Partial<Options>>
           const [rawFp, rawHeader, rawAlias]: (string | undefined)[] = capture
 
           const [fp, anchor] = splitAnchor(`${rawFp ?? ""}${rawHeader ?? ""}`)
-          const blockRef = Boolean(rawHeader?.match(/^#?\^/)) ? "^" : ""
+          const blockRef = Boolean(rawHeader?.match(/^#?\^/)) ? BLOCK_LINK_PREFIX : ""
           const displayAnchor = anchor ? `#${blockRef}${anchor.trim().replace(/^#+/, "")}` : ""
           const displayAlias = rawAlias ?? rawHeader?.replace("#", "|") ?? ""
           const embedDisplay = value.startsWith("!") ? "!" : ""
@@ -555,46 +556,54 @@ export const ObsidianFlavoredMarkdown: QuartzTransformerPlugin<Partial<Options>>
                   }
                 }
               } else if (inlineTagTypes.has(node.tagName)) {
-                const last = node.children.at(-1) as Literal
-                if (last && last.value && typeof last.value === "string") {
-                  const matches = last.value.match(blockReferenceRegex)
-                  if (matches && matches.length >= 1) {
-                    last.value = last.value.slice(0, -matches[0].length)
-                    const block = matches[0].slice(1)
+                const childWithBlockLink = node.children
+                  .find(c => typeof (c as Literal).value === "string" && (c as Literal).value.match(blockReferenceRegex)) as Literal
 
-                    if (last.value === "") {
-                      // this is an inline block ref but the actual block
-                      // is the previous element above it
-                      let idx = (index ?? 1) - 1
-                      while (idx >= 0) {
-                        const element = parent?.children.at(idx)
-                        if (!element) break
-                        if (element.type !== "element") {
-                          idx -= 1
-                        } else {
-                          if (!Object.keys(file.data.blocks!).includes(block)) {
-                            element.properties = {
-                              ...element.properties,
-                              id: block,
-                            }
-                            file.data.blocks![block] = element
+                const transform = (literal: Literal) => {
+                  if (!literal) return;
+                  if (!literal.value) return;
+                  if (!(typeof literal.value === "string")) return;
+                  
+                  const matches = literal.value.match(blockReferenceRegex)
+                  if (!matches) return;
+                  if (matches.length < 1) return;
+                  const block = BLOCK_LINK_PREFIX + matches[0].slice(1)
+                  
+                  if (literal.value === "") {
+                    // this is an inline block ref but the actual block
+                    // is the previous element above it
+                    let idx = (index ?? 1) - 1
+                    while (idx >= 0) {
+                      const element = parent?.children.at(idx)
+                      if (!element) break
+                      if (element.type !== "element") {
+                        idx -= 1
+                      } else {
+                        
+                        if (!Object.keys(file.data.blocks!).includes(block)) {
+                          element.properties = {
+                            ...element.properties,
+                            id: block,
                           }
-                          return
+                          file.data.blocks![block] = element
                         }
-                      }
-                    } else {
-                      // normal paragraph transclude
-                      if (!Object.keys(file.data.blocks!).includes(block)) {
-                        node.properties = {
-                          ...node.properties,
-                          id: block,
-                        }
-                        file.data.blocks![block] = node
+                        return
                       }
                     }
+                  } else {
+                    // normal paragraph transclude
+                    if (!Object.keys(file.data.blocks!).includes(block)) {
+                      node.properties = {
+                        ...node.properties,
+                        id: block.toLowerCase().replace('—', '--'),
+                      }
+                      file.data.blocks![block] = node
+                    }
                   }
+
                 }
-              }
+                transform(childWithBlockLink);
+              } 
             })
 
             file.data.htmlAst = tree
