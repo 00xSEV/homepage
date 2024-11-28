@@ -3,6 +3,7 @@ title: Home
 ---
 
 # Posts
+- [[./sorellaDeepDive.md|Deep dive into Sorella Angstrom]]
 - [[./deepDiveIntoMakerDaoEndgame|Deep dive into MakerDAO Endgame]]
 - [[./eulerDeepDive|Deep dive into Euler]]
 - [[./exactly|Exactly Protocol April 2024 Findings Review]]

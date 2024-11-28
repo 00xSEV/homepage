@@ -1,0 +1,990 @@
+---
+title: Deep dive into Sorella Angstrom
+---
+
+- Terms/symbols to read the post:
+  - Obsidian flavor of markdown
+    - `^anchorName` - at the end of the line is an anchor
+    - `[[#^anchorName]]` - link to the anchor
+  - `--` - start of the comment
+  - `xX` - some thoughts that turned out to be wrong
+  - Originally created in Obsidian. Open it there to collapse sections and bullet points, and view inlined previews.
+
+- Angstrom
+    - `_checkAngstromHookFlags` -- checks that the address has hooks set in the address
+    - execute
+        - check if it's whitelisted msg.sender, and not called this block
+    - unlockCallback -- called by UniV4 on execute; All the logic is here
+        - pics ^Angstrom-unlockCallback--pics
+            - ![[static/20241107090046.png]]
+            - ![[static/20241107090121.png]]
+            - From https://www.uint32.xyz/writing/uniswap-v4-lock-and-callback-mechanism
+        - called by uniswap
+            - on Angstrom.execute
+            - xX but probably can be called straight through uniswap -- can't, because `UniV4.unlock`calls back msg.sender
+        - https://docs.uniswap.org/contracts/v4/guides/unlock-callback
+            - https://docs.uniswap.org/contracts/v4/guides/hooks/your-first-hook
+            - https://www.uint32.xyz/writing/uniswap-v4-lock-and-callback-mechanism
+        - CalldataReaderLib.from(data) -- return 68 always, offset. Pointer
+            - .offset
+                - bytes
+                    - an array, so offset to after position in calldata + length, basically raw data without length or anything
+        - (reader, assets) = AssetLib.readFromAndValidate(reader) -- (reader=end (***reader***: moved to the end of the array we just read); ***assets***: position + length of assets array)
+            - reader.readU24End() -- get range where to read the data from (from;to) ^CR-readU24End
+                - steps explained
+                    - (pointer/self) -📍
+                    - {...some other data}📍{length(24 bits)}{data...}
+                    - read first 24 bits as length; len := `[0; ~16 mln]`
+                    - move pointer 24 bits to the right
+                    - {...some other data}{length 24 bits}📍{data...}
+                    - end (🚩) len bytes to the right
+                    - {...some other data}{length 24 bits}📍{data}🚩{some other data...}
+                - code
+                    - read first 24 bits as len
+                        - ignore the last 232 bits
+                    - move pointer (self) 3 bytes (24 bits) to the right
+                    - end := new pointer + length read in the first step
+                    - return (pointer after length, end of data)
+            - uint256 length = (end.offset() - reader.offset()) / ASSET_CD_BYTES; -- number of elements
+                - .offset -- unwrap, uint256
+                - data length / element length
+            - assets = AssetArray.wrap((reader.offset() << CALLDATA_PTR_OFFSET) | length); -- packed pointer(28 bytes) + length (4bytes) ^Angstrom-unlockCallback--assets
+                - (reader.offset() << CALLDATA_PTR_OFFSET) | length -- pack reader and length in one uint slot
+                    - (reader.offset() << CALLDATA_PTR_OFFSET) -- remove 4 bytes at the start, and 4 bytes (32) 0s in the end
+                        - reader -- pointer to the start of the data
+                        - CALLDATA_PTR_OFFSET = 32
+                        - << 32 -- remove the first 32 bits, add 32 0s in the end
+                        - reader is probably small enough that it will be ok
+                    - | length -- add length instead of 0s
+                        - length is  small enough to always fit
+                        - 2^24/68 = ~247k (246,723.7647058824)
+                        - log2(247k) = 18  (2^18 = ~262k)
+            - address newAddr = assets.getUnchecked(i).addr(); -- read address from packed `assets`
+                - assets.getUnchecked(i) -- absolute (in calldata) pointer to the element ^Assets-getUnchecked
+                    - uint256 raw_calldataOffset = AssetArray.unwrap(self) >> CALLDATA_PTR_OFFSET; -- remove length, get a normal pointer. Basically unpack the pointer
+                        - self -- assets, packed pointer + length
+                        - >> -- remove the last 4 bytes, pad on the left with 4 bytes of 0s
+                    - Asset.wrap(raw_calldataOffset + index * ASSET_CD_BYTES) -- absolute pointer to the element
+                        - index * ASSET_CD_BYTES -- the `index` element position from the start of the array
+                        - raw_calldataOffset + -- absolute position 
+                - .addr() -- get 20bytes at pointer as address ^Assets-addr
+                    -  -- load address "addr" from calldata (in specific position after `asset` pointer, 0 here)
+                    - self -- absolute pointer in the calldata to the element (address) we want to read
+                    - value := shr(96, calldataload(add(self, ADDR_OFFSET))) -- read 20 bytes on `self` as address
+                        - add(self, ADDR_OFFSET) -- offset of address data  in bytes32 slot; 0 for address (not sure why, should be clear after other data)
+                        - calldataload load 32 bytes from self
+                        - remove the last 12 bytes, address is 20 bytes, everything else on the right we ignore
+                            - the [docs](https://docs.soliditylang.org/en/latest/abi-spec.html#formal-specification-of-the-encoding) say on the left, my test `AddressEncodingTest` says on the left
+                            - probably some custom encoding; yeah, packed encoding. We start to read from address, and then add 0s on the left to make it in valid format
+            - validate that ordered from small to big, no duplicates
+        - `(reader, pairs) = PairLib.readFromAndValidate(reader, assets, _configStore)` -- reads from calldata, validates, transform/load and store it to memory; Returns memory (pointer to the end in calldata; pairs: memory pointer to the start of pairs data + length) ^Angstrom-unlockCallback--pairs
+            - `_configStore` -- address
+            - [[#^CR-readU24End]] 
+                - ![[#^CR-readU24End]] 
+            - length -- again, number of elements
+            - 0x40 -- free memory pointer
+            - raw_memoryEnd := add(raw_memoryOffset, mul(PAIR_MEM_BYTES, length));;;              mstore(0x40, raw_memoryEnd) -- update new empty memory position to after pairs
+                - mul(PAIR_MEM_BYTES, length) -- how much memory for the whole array of pairs
+                    - PAIR_MEM_BYTES -- 192, they say 6x32 words
+                - add () -- new empty memory position
+                    - why PAIR_MEM_BYTES in bytes and we add it to `raw_memoryOffset` in bits?
+                        - 0x40 = 64. Oh, in bytes
+                        - + 192 bytes x length
+            - pairs := or(shl(PAIR_ARRAY_MEM_OFFSET_OFFSET, raw_memoryOffset), length) -- start of the data + length packed ^Pair-readFromAndValidate--pairs
+                - shl(PAIR_ARRAY_MEM_OFFSET_OFFSET, raw_memoryOffset) -- add 32 0s in the end and remove first 32 symbols from raw_memoryOffset
+                    - PAIR_ARRAY_MEM_OFFSET_OFFSET
+                    - raw_memoryOffset -- data start in memory
+                - or -- add length to the end, that we just shifted
+            - Load, decode and validate assets of pair.  -- load from calldata, validate that sorted + store in memory
+                - -- overview
+                    - from indeces get positions of asset addresses in calldata
+                    - make sure all sorted
+                    - store in memory, as 1 word each
+                - raw_memoryOffset -- pointer to start of data, updates each loop ^Pair-readFromAndValidate--memoryOffset
+                - raw_memoryEnd -- end of data
+                - for -- same as while here; while have something to read
+                - reader.readU32() -- move pointer, return read uint32
+                - assets.get(indices >> INDEX_A_OFFSET).addr() -- read 20 bytes as address at pozition encoded in indices
+                    - indices >> INDEX_A_OFFSET -- read first 16 bits
+                    - .get -- get pointer to the element
+                        - check non OutOfBounds + return ![[#^Assets-getUnchecked]]
+                            - will it allow to read past bounds? -- no
+                                - length 5; last index 4; 0,1,2,3,4-ok; 5,6...-revert
+                    - [[#^Assets-addr]]
+                - assets.get(indices & INDEX_B_MASK).addr() -- get address at 2nd index encoded in indeces
+                    - read last 16 bits as index
+                    - get address at that index
+                - (indices <= lastIndices || asset0 >= asset1) -- revert if !sorted or has duplicates
+                    - indices <= lastIndices -- not sorted; must be from low to high
+                        - indices -- just read uint32
+                        - lastInidices -- 0 at first, next loops =indices
+                    - asset0 >= asset1 -- not sorted
+                - mstore(add(raw_memoryOffset, PAIR_ASSET0_OFFSET), asset0) -- store asset0 at raw_memoryOffset; asset1 at raw_memoryOffset + 0x20 (32 bytes)
+                    - add(raw_memoryOffset, PAIR_ASSET0_OFFSET)
+            - Load and store pool config. -- read index from calldata; calculate keyHash (asset0 + asset1); load from `store` contract tickSpacing and fee; validate that we loaded correct keyHash
+                - key := shl( HASH_TO_STORE_KEY_SHIFT, keccak256(add(raw_memoryOffset, PAIR_ASSET0_OFFSET), 0x40) ) -- keccak256 of asset0+asset1, remove 5 bytes in the start, pad with 0s in the end ^PairLib-readFromAndValidate--key
+                    - HASH_TO_STORE_KEY_SHIFT -- 40 bits shift left => remove first 40 bits, pad with 40 0s in the end
+                    - add(raw_memoryOffset, PAIR_ASSET0_OFFSET) -- data start in memory, where we just saved asset0 and asset1
+                        - raw_memoryOffset -- data start in memory
+                        - PAIR_ASSET0_OFFSET -- 0
+                    - keccak256(..., 0x40) -- hash asset0+asset1
+                    - shl -- remove first 5 bytes, leave 27 bytes of hash
+                - (reader, storeIndex) = reader.readU16(); -- storeIndex the next 16 bits
+                - store.get(key, storeIndex) -- read tickSpacing and fee from `store` (contract)
+                    - PoolConfigStoreLib.get -- return tickSpacing and fee encoded in PoolConfigStore at index `index`, verify key (set to k256(asset0 + asset1))
+                        - extcodecopy(self, 0x00, add(STORE_HEADER_SIZE, mul(ENTRY_SIZE, index)), ENTRY_SIZE) --  read from PoolConfigStore a word at index 
+                            - -- read 32 bytes to 0x00 (scratch space) from the specified word index
+                            - self -- PCS == address
+                            - 0x00 -- memory start (where to save)
+                            - add(STORE_HEADER_SIZE, mul(ENTRY_SIZE, index)) -- where to read absolute
+                                - STORE_HEADER_SIZE -- a byte, probably 0x00 (see docs/bundle-building.md "Pool Config Store" )
+                                - mul(ENTRY_SIZE, index) -- where to start reading relative to the start of the data
+                                    - ENTRY_SIZE -- one word, 32 bytes
+                                    - index -- which element do we request
+                            - ENTRY_SIZE -- 32 bytes, how much to read
+                        - entry := mload(0x00) -- now save what we read to a variable
+                        - entry := mul(entry, eq(key, and(entry, KEY_MASK))) -- if key !== entry without last 5 bytes => entry = 0
+                            - entry
+                            - eq(key, and(entry, KEY_MASK)) -- make sure we read the right key
+                                - key -- they key we got above [[#^PairLib-readFromAndValidate--key]]
+                                - and(entry, KEY_MASK) -- entry without the last 5 bytes
+                                    - entry -- the word we just read
+                                    - KEY_MASK  -- word without last 5 bytes
+                                        - -- type(uint).max without last 10 fs, 40 bits, 5 bytes
+                        - if (entry.isEmpty()) revert NoEntry(); -- if entry not set OR entry first 27 bytes != key [[#^PairLib-readFromAndValidate--key]]
+                        - tickSpacing = entry.tickSpacing();
+                            - spacing := and(TICK_SPACING_MASK, shr(TICK_SPACING_OFFSET, self)) -- skip 27 bytes, read 2 bytes, ignore the last 3 bytes
+                                - -- {skip 27 bytes}{2 bytes to read}{3 bytes cut}
+                                - TICK_SPACING_MASK - 0xffff (2 bytes)
+                                - shr(TICK_SPACING_OFFSET, self) -- remove last 24 bits (3 bytes)
+                                    - TICK_SPACING_OFFSET -- 24
+                                    - self -- uint256
+                        - feeInE6 = entry.feeInE6();
+                            - fee := and(FEE_MASK, shr(FEE_OFFSET, self)) -- read last 3 bytes
+                                - FEE_MASK -- 0xffffff (3 bytes)
+                                - shr(FEE_OFFSET, self) -- noop
+                                    - FEE_OFFSET -- 0
+                                    - self -- uint256
+                - mstore(add(raw_memoryOffset, PAIR_TICK_SPACING_OFFSET), tickSpacing) -- store tickSpacing in memory; at memoryOffset + 0x40
+                    - add(raw_memoryOffset, PAIR_TICK_SPACING_OFFSET) -- pointer to pairTick place in memory
+                        - raw_memoryOffset -- [[#^Pair-readFromAndValidate--memoryOffset]]
+                        - PAIR_TICK_SPACING_OFFSET -- 0x40, 2 words
+                    - tickSpacing -- just read above
+                - mstore(add(raw_memoryOffset, PAIR_FEE_OFFSET), feeInE6) -- store feeInE6 in memory; at memoryOffset +  0x60
+            - Load main AB price, compute inverse, store both. -- read u256 from calldata; store it as well as inverse of it
+                - price1Over0.invRayUnchecked() -- 1/price1Over0
+                    - y := div(RAY_2, x)
+                        - 1e27 x 1e27 / Number x 1e27 = Result with 1e27 precision
+                            - x is 1e27, like 1234.567....9
+                - mstore(add(raw_memoryOffset, PAIR_PRICE_0_OVER_1_OFFSET), price0Over1) -- store price0Over1; at raw_memoryOffset + 0x80
+                    - raw_memoryOffset -- [[#^Pair-readFromAndValidate--memoryOffset]]
+                - mstore(add(raw_memoryOffset, PAIR_PRICE_1_OVER_0_OFFSET), price1Over0)  -- store price0Over1; at raw_memoryOffset + 0xa0 (0x80 + 0x20)
+                - raw_memoryOffset += PAIR_MEM_BYTES; -- move pointers 6 words
+            - returns -- (pointer to the end; pointer to the start + length)
+                - end -- end of pairs data, see in the begining or  [[#^CR-readU24End]] 
+                - pairs -- ![[#^Pair-readFromAndValidate--pairs]]
+            - Result in memory(each item 32 bytes = 1 word): -- {asset0; asset1; tickSpacing; feeInE6; price0Over1; price1Over0};  ^Pair-readFromAndValidate--result
+        - `_takeAssets` -- for each asset flash-borrow them from uniswap, increase deltas
+            - uint256 length = assets.len();
+                - get last LENGTH_MASK (32 bits) from assets as length
+                - assets -- pointer + length ![[#^Angstrom-unlockCallback--assets]]
+            - ![[#^Assets-getUnchecked]]
+            -  ![[#^Assets-getUnchecked]]
+            - `_take` -- flash-borrow money to `this` from UniV4, increase bundleDeltas for the asset
+                - uint256 amount = asset.take(); -- load uint128 "take" from calldata (in specific position after `asset` pointer)
+                    - amount := shr(128, calldataload(add(self, TAKE_OFFSET))) -- delete last 128 bits (16 bytes), because it's from the next word
+                        - calldataload(add(self, TAKE_OFFSET)) -- load "take" word, amount uint128
+                            - add(self, TAKE_OFFSET) -- where is "take" word in calldata (pointer)
+                                - self -- absolute pointer in calldata to asset i
+                                - TAKE_OFFSET -- 36 bytes
+                    - address addr = asset.addr();  -- load address from `asset` pointer from calldata
+                        - ![[#^Assets-addr]]
+                - UNI_V4.take -- flash-borrow money to `this`
+                    - `_c(addr)` -- just wrap as Currency type
+                    - file:///Users/sev/Downloads/whitepaper-v4-1.pdf
+                        - > The new take() and settle() functions
+                            - > can be used to borrow or deposit funds to the pool, respectively. 
+                - bundleDeltas.add(addr, amount); -- make the asset on contract more solvent
+                    - bundleDeltas -- mapping(address asset => tint256 netBalances) deltas;
+                    - DeltaTrackerLib.add
+                        - delta.set(MixedSignLib.add(delta.get(), amount));
+                            - MixedSignLib.add(delta.get(), amount) -- add `take` amount, contract has more funds
+                                - delta.get() -- just load int256 from transient storage
+                                - amount -- take amount
+        - `_updatePools` -- make swaps, update rewards
+            - pairs [[#^Angstrom-unlockCallback--pairs]]
+            - (reader, end) = reader.readU24End(); -- read u24 as length => (reader: move pointer to the start of data; end: end of pool data (start + length))
+                - let len := shr(232, calldataload(self)) -- load first 24 bits to `len`
+                    - self -- reader, pointer to the end of pairs data
+                - self := add(self, 3) -- move pointer 3 bytes (24 bits)
+                - end := add(self, len) -- end of pools data (start_pointer=self + length of data)
+            - SwapCall memory swapCall = SwapCallLib.newSwapCall(address(this)); -- set selector, fee, `this` as hook, hookDataRelativeOffset
+            - `_updatePool` -- make swaps, update rewards
+                - pool and pair often synonyms in this code
+                - reader -- pointer to pools data, moved every `_updatePool`
+                - variantByte -- 1st byte in pool data
+                - variantMap = PoolUpdateVariantMap.wrap(variantByte); -- uint8, flags-configs: 0for1, currentOnly;
+                - swapCall.setZeroForOne(variantMap.zeroForOne()); -- read and set 0for1
+                    - variantMap.zeroForOne() -- last bit true/false in uint8
+                - (reader, pairIndex) = reader.readU16(); -- read uint16 as pairIndex, move pointer
+                - pairs.get(pairIndex).getPoolInfo();  -- load from memory pair i info (assets01, tickSpacing)
+                    - .get -- pointer to memory where the pair encoded, the data `pairs`(not `pair`) is {length;pair1;pair2;...} ^Pair-get
+                        - pairs -- pointer to the start of pairs data + length
+                        - pairIndex -- is read from calldata already, was encoded in pool/pair data
+                        - self -- pointer to the start of pairs data + length
+                        - check OOB
+                        - uint256 raw_memoryOffset = PairArray.unwrap(self) >> PAIR_ARRAY_MEM_OFFSET_OFFSET; -- remove length, decode absolute pointer to calldata
+                        - Pair.wrap(raw_memoryOffset + index * PAIR_MEM_BYTES); -- move pointer to i Pair element
+                    - getPoolInfo
+                        - load {bytes20, bytes20, int24} as asset0, asset1, tickSpacing
+                - PoolId id = swapCall.getId(); -- hash of 5 vars in SwapCall (assets0...hook); UniV4 pool id format
+                    - id := keccak256(add(self, POOL_KEY_OFFSET), POOL_KEY_SIZE) -- hash of asset0...hook in SwapCall
+                        - add(self, POOL_KEY_OFFSET)
+                            - self -- pointer to swapCall struct
+                            - POOL_KEY_OFFSET -- 32 bytes, `leftPaddedSelector`
+                        - POOL_KEY_SIZE -- 160 bytes, 5 words
+                            - length in bytes or bits? -- bytes
+                - (reader, amountIn) = reader.readU128(); -- 128bit as amountIn
+                - int24 tickBefore = UNI_V4.getSlot0(id).tick(); -- read current tick for the pool
+                - SignedUnsignedLib.neg(amountIn); -- negate amountIn, means "exactIn"
+                    - See v4-core.IPoolManager.SwapParams.amountSpecified
+                        - > The desired input amount if negative (exactIn), or the desired output amount if positive (exactOut)
+                    - x > (1 << 255) -- make sure does not underflow
+                        - -- if x > (1<<255) => -x < type(int).min
+                - swapCall.call -- call UniV4.swap once
+                    - call(gas(), uni, 0, add(self, CALL_PAYLOAD_START_OFFSET), CALL_PAYLOAD_CD_BYTES, 0, 0) -- call UniV4.swap with the data set in  SwapCall
+                        - add(self, CALL_PAYLOAD_START_OFFSET) -- cut first 28 bytes, so start from function selector (leftPaddedSelector); here swap selector
+                        - CALL_PAYLOAD_CD_BYTES -- 324, 4bytes selector + 10 words/vars
+                        - why no data is passed to the hook? -- the hook won't be called when msg.sender == hook (our case)
+                            - hook -- address(this)
+                            - why no beforeSwap hook exist on address(this)
+                            - it seems that when `if (msg.sender == address(self)) return`, so when already inside the hook (our case) don't call anything else
+                    - IPoolManager.swap encodes
+                        - https://www.rareskills.io/post/abi-encoding
+                            - Structs -- one after another, see SwapEncoding.t.sol
+                            - Strings -- offset, length, data, see same
+                - currentTick = UNI_V4.getSlot0(id).tick(); -- get new tick after the swap
+                - `poolRewards[id].updateAfterTickMove(id, UNI_V4, tickBefore, currentTick, swapCall.tickSpacing);` -- update `rewardGrowthOutside` for each crossed tick
+                    - id -- poolId
+                    - `poolRewards` -- internal accounting for rewards (to give away?)
+                    - updateAfterTickMove -- update `rewardGrowthOutside` for each crossed tick
+                        - if (newTick > prevTick) { -- token0 price went up; if tick moved update `rewardGrowthOutside` for all affected initialized ticks
+                            - -- price of token0(X) in token1(Y), Y/X increased. More Y for X. X is more expensive
+                            - if (newTick.normalizeUnchecked(tickSpacing) > prevTick) { -- if price moved up (of token0) and tick movedUp (not on the same tick anymore) => update each initialized tick's `rewardGrowthOutside`
+                                - TickLib.normalizeUnchecked -- round down to closest allowed tick (positive -> down; negative -> up) ^TickLib-normalizeUnchecked
+                                    - mul(sub(sdiv(tick, tickSpacing), slt(smod(tick, tickSpacing), 0)), tickSpacing) -- get back to tick
+                                        - sub(sdiv(tick, tickSpacing), slt(smod(tick, tickSpacing), 0))  -- [[#^TickLib-compress]]
+                                        - tickSpacing
+                                    - WARN: Can underflow for values of `tick < mul(sdiv(type(int24).min, tickSpacing), tickSpacing)`.
+                                        - if newTick is negative. And pretty small, around `type(int24).min`; or tickSpacing is very high
+                                - -- if (newClosestAllowedTick > prevTick) == tick moved up
+                                - `_updateTickMoveUp(self, uniV4, id, prevTick, newTick, tickSpacing);` -- move initialized tick by tick, update `.rewardGrowthOutside` for it inside Angstrom ^IUniV4---updateTickMoveUp
+                                    - (initialized, tick) = uniV4.getNextTickGt(id, tick, tickSpacing); -- get next tick (bigger, right) after tick=prevTick that is initialized ^IUniV4-getNextTickGt
+                                        - tick -- previous tick
+                                        - (int16 wordPos, uint8 bitPos) = TickLib.position(TickLib.compress(tick, tickSpacing) + 1);  -- next allowed tick in {int16; uint8} format instead of {int24} (it's the way UniV4 store it too, 2^8=256, so 256 flags true/false in wordPos => word mapping)
+                                            - TickLib.compress(tick, tickSpacing) -- closest compressed tick (rounds up on negative, down on positive) ^TickLib-compress
+                                                - compressed := sub(sdiv(tick, tickSpacing), slt(smod(tick, tickSpacing), 0)) -- tick/tickSpacing; if tick is positive round down, if tick is negative round up; if mod == 0 no rounding 
+                                                    - sdiv(tick, tickSpacing) -- round down, 
+                                                        - tick -- newTick
+                                                        - tickSpacing -- std, >0
+                                                    - slt(smod(tick, tickSpacing), 0) -- is tick negative
+                                                        - smod(tick, tickSpacing) -- mod from tick/tickSpacing
+                                                            - tick
+                                                            - tickSpacing
+                                            - TickLib.position -- split to (int16; uint8)
+                                                - xX old 
+                                                    - wordPos = int16(compressed >> 8); -- first 16 bits as int16
+                                                        - compressed >> 8 -- delete first 8 bits
+                                                    - bitPos = uint8(int8(compressed)); -- last 8 bits as uint8
+                                                - wordPos := sar(8, compressed) -- first 24-8=16 bits as int16
+                                                - bitPos := and(compressed, 0xff) -- last 8 bits as uint8
+                                        - (initialized, bitPos) = self.getPoolBitmapInfo(id, wordPos).nextBitPosGte(bitPos); -- (init: are bitPos and all to the left 0s; bitPos: first 1, starting from bitPos inclusive)
+                                            - self -- UniV4 address, lib is attached to it
+                                            - getPoolBitmapInfo(id, wordPos) -- load bitmap word of wordPos  ^IUniV4-getPoolBitmapInfo
+                                                - uint256 slot = self.computeBitmapWordSlot(id, wordPos); -- get slot for `pools[id][wordPos]` ^IUniV4-computeBitmapWordSlot
+                                                    - self -- UniV4 address, uses lib IUniV4
+                                                    - id -- keccak256 hash of 5 vars, see [[#^PairLib-readFromAndValidate--key]]
+                                                    - `mstore(0x00, id) mstore(0x20, _POOLS_SLOT) slot := keccak256(0x00, 0x40)` -- calculate slot address for pools mapping
+                                                        - > The value corresponding to a mapping key `k` is located at `keccak256(h(k) . p)`;; k--key; p--slot
+                                                            - https://docs.soliditylang.org/en/latest/internals/layout_in_storage.html#mappings-and-dynamic-arrays 
+                                                    - `mstore(0x00, wordPos) mstore(0x20, add(slot, _POOL_STATE_BITMAP_OFFSET)) slot := keccak256(0x00, 0x40)` -- compute slot for `pools[id][wordPos]`
+                                                        - does uniV4 uses wordPos (first 16 bits) to save storage? -- yep, `mapping(int16 wordPos => uint256) tickBitmap;`
+                                                        - `add(slot, _POOL_STATE_BITMAP_OFFSET)` -- because it's another mapping, use the same rules
+                                                - self.gudExtsload(slot); -- load word from UniV4 storage by calling Uniswap function .extsload(slot) ^IUniV4-gudExtsload
+                                                    - `mstore(0x20, slot) mstore(0x00, EXTSLOAD_SELECTOR)`  -- prepare to call UniV4.extsload(slot)
+                                                        - -- put selector for UNI_V4.extsload + slot (parameter)
+                                                    - if iszero(staticcall(gas(), self, 0x1c, 0x24, 0x00, 0x20)) {
+                                                        - staticcall(gas(), self, 0x1c, 0x24, 0x00, 0x20)
+                                                            - self -- UniV4
+                                                            - 0x1c, 0x24 -- starting from selector (skipped 28 bytes) call 4+32 bytes == call .extsload(slot)
+                                                            - 0x00, 0x20 -- put data in 0x00
+                                                - @dev WARNING: use of this method with a dirty `int16` for `wordPos` may be vulnerable as the value is taken as is and used in assembly. If not sign extended will result in useless slots. -- basically if we use assembly it will pad with 0s, but for negative number we need to pad with 1s, something like it  
+                                            - nextBitPosGte(bitPos) -- return index of first 1, starting from bitPos including, going left. 255 if bitPos and everything to the left in the word are 0s ^TickLib-nextBitPosGte
+                                                - uint256 relativePos = LibBit.ffs(word >> bitPos); -- position from the end of the first bit set to 1 ^LibBit-ffs
+                                                    - word >> bitPos -- make the required bit (flag true/false) the last bit. Remove everything to the right (= before)
+                                                    - ffs -- skipped, from solady lib low-level; return the index of the least significant bit set to 1
+                                                        - x -- transformed word, see >> above
+                                                        - x := and(x, add(not(x), 1)) -- so it should isolate the least significant bit
+                                                            - examples:
+                                                                - 0101 -> 1010 -> 1011 -> 0001
+                                                                - 1010 -> 0101 -> 0110 -> 0010
+                                                                - 1111 -> 0000 -> 0001 -> 0001
+                                                                - 1000 -> 0111 -> 1000 -> 1000
+                                                            - x
+                                                            - add(not(x), 1) -- make our bit as it was 1->0->1, else 0->1->0
+                                                                - examples
+                                                                    - 0101 -> 1010 -> 1011
+                                                                    - 1010 -> 0101 -> 0110
+                                                                    - 1111 -> 0000 -> 0001
+                                                                    - 1000 -> 0111 -> 1000
+                                                                - not(x) -- negate our last bit; 1->0; 0->1;
+                                                                    - 0101 -> 1010
+                                                                    - 1010 -> 0101
+                                                                    - 1111 -> 0000
+                                                                    - 1000 -> 0111
+                                                                - 1
+                                                        - further is skipped
+                                                - initialized = relativePos != 256; -- initialized if x != 0; 256 signifies that x was 0
+                                                - nextBitPos = initialized ? uint8(relativePos + bitPos) : type(uint8).max; -- if initalized return first bit == 1; for position  >= bitPos; otherwise 255 (when it was all 0s)
+                                                    - relativePos + bitPos -- because we moved word >> on bitPos => removed everything after bitPos, but leave bitPos
+                                                        - e.g. bitPos == 0, we removed nothing, ffs is 0 if word was set on position bitPos
+                                                        - bitPos == 1, we again start from bitPos
+                                        - TickLib.toTick(wordPos, bitPos, tickSpacing); -- convert to normal full tick
+                                            - wordPos -- in UniV4 mapping Pool.State.tickBitmap (`_pools[bytes32 id][int16 wordPos] => uint256 word`)
+                                            - bitPos -- first 1, starting from bitPos inclusive
+                                            - `(int24(wordPos) * 256 + int24(uint24(bitPos))) * tickSpacing` -- 
+                                                - examples:
+                                                    - not initialized -> all 1s, so some strange tick far away
+                                                    - some value -> specific next tick, that is set
+                                                - `(int24(wordPos) * 256 + int24(uint24(bitPos)))`  -- convert back to compressed {int16 wordPos; uint8 bitPos} => {int24}
+                                                    - `int24(wordPos) * 256` -- move 8 bits to the left
+                                                    - `int24(uint24(bitPos))` -- just convert types
+                                                - `tickSpacing`
+                                    - if (newTick < tick) break; -- if we over the current tick stop
+                                        - tick <= newTick -- go to the right tick by tick (skip uninitialized) until we meet newTick (where the tick after swap)
+                                            - tick -- next initialized tick after `prevTick` or then `tick`
+                                            - go to the next initialized tick, until it's over `newTik`
+                                    - if (initialized) { -- if we met an initialized tick during the current loop
+                                    - `self.rewardGrowthOutside[uint24(tick)] = self.globalGrowth - self.rewardGrowthOutside[uint24(tick)];` -- when we cross the tick we update fees
+                        - `} else if (newTick < prevTick) {` -- same, update `rewardGrowthOutside`
+                            - price token0 moved down
+                            - if (newTick < prevTick.normalizeUnchecked(tickSpacing)) { -- if price moved down (of token0) and tick movedDown (not on the same tick anymore) => update each initialized tick's `rewardGrowthOutside`
+                            - `_updateTickMoveDown` -- update `rewardGrowthOutside` for each crossed initialized tick
+                                - See [[#^IUniV4---updateTickMoveUp]]
+                                - tick -- prevTick
+                                - IUniV4.getNextTickLe -- get next initialized tick before=down the requested one
+                                    - See [[#^IUniV4-getNextTickGt]]
+                                    - (int16 wordPos, uint8 bitPos) = TickLib.position(TickLib.compress(tick, tickSpacing)); --  compress tick and convert to {int16; uint8}
+                                        - [[#^TickLib-compress]]
+                                    - (initialized, bitPos) = self.getPoolBitmapInfo(id, wordPos).nextBitPosLte(bitPos); -- first initialized tick, starting from bitPos including, going right (=down, before)
+                                        - [[#^IUniV4-getPoolBitmapInfo]]
+                                        - TickLib.nextBitPosLte(bitPos) -- return index of first 1, starting from bitPos including, go to the right (=before). 0 if bitPos and everything to the right (=before) in the word are 0s
+                                            - See [[#^TickLib-nextBitPosGte]]
+                                            - uint8 offset = 0xff - bitPos; -- all 1s, but set to 0 prevTick's bit; We will move all but bitPos bits
+                                                - 0xff -- 255
+                                                - bitPos -- prevTick in bitPos format, index
+                                            - uint256 relativePos = LibBit.fls(word << offset);  -- first initialized tick from the left, first 1 from the left, but also we moved left all but bitPos bits, so relative to bitPos
+                                                - word << offset -- remove all but bitPos bits. By moving left. (== everything after bitPos)
+                                                    - word -- 256 bit of true/false flags
+                                                    - offset -- `[0;255]`; bitPos tells how many bits we leave. Everything else is shifted left
+                                                - LibBit.fls -- find the leftmost 1
+                                                    - See [[#^LibBit-ffs]]
+                                                    - /// @dev Find last set.
+                                                    - /// Returns the index of the most significant bit of `x`, -- the leftmost
+                                                    - /// counting from the least significant bit position. -- the rightmost
+                                                    - /// If `x` is zero, returns 256.
+                                            - initialized = relativePos != 256; -- 256 means initialized bit not found to the left of the bitPos (including bitPos)
+                                            - nextBitPos = initialized ? uint8(relativePos - offset) : 0; -- hasInitializedBit to the left of bitPos ? return absolute position of that tick : 0
+                                - if (tick <= newTick) break;
+                                    - we are going from bigger to lower. So as soon as we below the current tick after swap (newTick) we stop
+                                - `if (initialized) {`...`self.rewardGrowthOutside[uint24(tick)] = self.globalGrowth - self.rewardGrowthOutside[uint24(tick)]; `-- update rewards if crossed the tick
+                - `(reader, rewardTotal) = _decodeAndReward( variantMap.currentOnly(), reader, poolRewards[id], id, swapCall.tickSpacing, currentTick );`  -- update globalGrowth, `rewardGrowthOutside` for each affected tick (set by node); return total updates
+                    - variantMap.currentOnly(),  -- some flag, not sure yet
+                    - reader, -- after amountIn, pointer to callData
+                    - `poolRewards[id]`,  -- internal rewards accounting for ticks
+                    - id, -- pool id, uniV4 format (keccak of 5 vars)
+                    - swapCall.tickSpacing, 
+                    - currentTick -- tick after a swap
+                    - `_decodeAndReward` 
+                        - if (currentOnly) { -- grow `poolRewards_.globalGrowth` on user-provided value
+                            - (reader, amount) = reader.readU128();
+                            - `poolRewards_.globalGrowth += X128MathLib.flatDivX128(amount, UNI_V4.getPoolLiquidity(id));`  -- `(amount * 2**128) / pools[id].liquidity`
+                                - amount -- some user-provided amount
+                                - UNI_V4.getPoolLiquidity(id) -- load `pools[id].liquidity` from UniV4 
+                                    - uint256 slot = self.computePoolStateSlot(id); -- compute slot to read in uniswap, see `_POOLS_SLOT` part of [[#^IUniV4-computeBitmapWordSlot]]
+                                    - `uint256 rawLiquidity = self.gudExtsload(slot + _POOL_STATE_LIQUIDITY_OFFSET);`  -- load liquidity from uniswap, uint128 btw
+                                        - `slot + _POOL_STATE_LIQUIDITY_OFFSET`    -- `pools[id].liquidity`
+                                            - see 2nd part of, somewhat similar, but not keccak256 neaded, because uint128, simple slot [[#^IUniV4-getPoolBitmapInfo]]
+                                        - [[#^IUniV4-gudExtsload]]
+                                - X128MathLib.flatDivX128 -- `(numerator * 2**128) / denominator`
+                                    - result := div(shl(128, numerator), denominator)
+                                        - shl(128, numerator) -- `numerator * 2**128)`
+                                        - denominator
+                        - startTick, liquidity -- user/node provided in calldata
+                        - `(CalldataReader newReader, CalldataReader amountsEnd) = reader.readU24End();` -- data boundaries in calldata, from newReader to amountsEnd
+                        - (newReader, total, cumulativeGrowth, endLiquidity) = -- update `rewardGrowthOutside` on `amount`s, return accumulators of amount, growth. Also new liquidity
+                            - `startTick <= pool.currentTick` -- user/node provided tick <= tick after a swap
+                                - startTick -- user/node provided
+                                - pool.currentTick -- tick after a swap
+                            - `? _rewardBelow(poolRewards.rewardGrowthOutside, startTick, newReader, liquidity, pool)` ^GOU---rewardBelow
+                                - poolRewards.rewardGrowthOutside, -- duplicated calculation of rewards, the same as in UniV4
+                                - startTick, -- user/node provided
+                                - newReader, -- start of data for reward
+                                - liquidity, -- user/node provided
+                                - pool -- (id, tickSpacing, currentTick(after swap))
+                                - `_rewardBelow` -- moving from left to the currentTick update `rewardGrowthOutside` on `amount`s, return accumulators of amount, growth. Also new liquidity
+                                    - read amount from user/node-provided value
+                                    - total += amount;
+                                    - cumulativeGrowth += X128MathLib.flatDivX128(amount, liquidity); -- increase on user/node provided values
+                                    - `rewardGrowthOutside[uint24(rewardTick)] += cumulativeGrowth;` -- grow outside of specific tick (initially user provided, then nextTickGt)
+                                        - rewardTick = startTick -- also user/node provided tick
+                                    - `(, int128 netLiquidity) = UNI_V4.getTickLiquidity(pool.id, rewardTick);` -- read `pools[id].ticks[tick].liquidityNet`
+                                        - See: starts as [[#^IUniV4-computeBitmapWordSlot]]
+                                        - `mstore(0x20, _POOLS_SLOT) mstore(0x00, id)` --  prepare calculating `pools[id]` (for specific id)
+                                        - `mstore(0x20, add(keccak256(0x00, 0x40), _POOL_STATE_TICKS_OFFSET)) mstore(0x00, tick)` -- prepare to calculate slot for `pools[id].ticks[tick]` (id and tick user/node-provided)
+                                            - keccak256(0x00, 0x40) -- calculate `pools[id]` for `id` provided
+                                            - `add(..., _POOL_STATE_TICKS_OFFSET)` -- find ticks slot in the `pools[id]` => `pools[id].ticks`
+                                            - mstore(0x00, tick) -- prepare to read key `tick` (specific tick) from `pools[id].ticks`
+                                        - `mstore(0x20, keccak256(0x00, 0x40)) mstore(0x00, EXTSLOAD_SELECTOR)` -- prepare to call .extsload(`pools[id].ticks[tick]` slot)
+                                            - `mstore(0x20, keccak256(0x00, 0x40))` -- store `pools[id].ticks[tick]` slot in 0x20
+                                            - put selector in 0x00
+                                        - `if iszero(staticcall...` -- See [[#^IUniV4-gudExtsload]]; Baically load slot from UniV4 and revert on failure
+                                        - let packed := mload(0x00) -- loaded slot
+                                        - and(packed, 0xffffffffffffffffffffffffffffffff) -- last 128 bit, Note: The first item in a storage slot is stored lower-order aligned.
+                                        - liquidityNet := sar(128, packed) -- first 128 bit
+                                    - liquidity = MixedSignLib.add(liquidity, netLiquidity); -- user/node provided +- diff
+                                        - if shr(128, z) { -- we used to uint128, if we have anything set above it (negative number, >type(uint128).max) => overflow
+                                    - (initialized, rewardTick) = UNI_V4.getNextTickGt(pool.id, rewardTick, pool.tickSpacing); -- See [[#^IUniV4-getNextTickGt]], get next initialized tick after rewardTick
+                                    - while (rewardTick <= pool.currentTick); -- we move from left to right, when we got to currentTick no rewards anymore. But for the current one we may have some
+                                    - return (reader, total, cumulativeGrowth, liquidity); -- see below
+                                        - reader -- moved every loop on U128, when it reads amount, user/node provided
+                                        - total -- all amounts
+                                        - cumulativeGrowth -- sum of all growth
+                                        - liquidity -- current liquidity on the tick we are in
+                            - `: _rewardAbove(poolRewards.rewardGrowthOutside, startTick, newReader, liquidity, pool);`
+                                - See [[#^GOU---rewardBelow]], almost the same
+                                - Diffs
+                                    -  MixedSignLib.add => sub -- we move from right to left now, so we negate liquidity sign on tick crossing
+                                    - getNextTickGt => getNextTickLt -- from right to left, so get the previous one
+                                    - (rewardTick <= pool.currentTick) => (rewardTick > pool.currentTick) -- reward every tick but the one we just crossed, from right to left
+                        - (newReader, donateToCurrent) = newReader.readU128()
+                        - cumulativeGrowth += X128MathLib.flatDivX128(donateToCurrent, endLiquidity); -- update reward per 1L
+                            - `(donateToCurrent * 2**128) / endLiquidity`
+                                - donateToCurrent -- some kind of rewards donation
+                                - endLiquidity -- L between current ticks
+                        - total += donateToCurrent; -- we will need to get this donation from deltas
+                        - newReader.requireAtEndOf(amountsEnd); -- revert if we are not at expected end (length was encoded in readU24End above)
+                        - if (endLiquidity != currentLiquidity) { revert WrongEndLiquidity(endLiquidity, currentLiquidity); -- make sure liquidity calculated by Angstrom is == UniV4's one
+                        - poolRewards.globalGrowth += cumulativeGrowth;
+                - bundleDeltas.sub(swapCall.asset0, rewardTotal); -- for now assume that it's debt in a bundle for asset0, it's increased because of all the rewards
+        - `_validateAndExecuteToBOrders` -- while !end update deltas, get/send tokens
+            - reader -- pointer to the not yet read calldata, after pools updates
+            - pairs -- memory pointer + length
+            - `TypedDataHasher typedHasher = _erc712Hasher();`  -- put 0x1901 + `_domainSeparator` + 32bytes (maybe dirty) in free memory, return pointer to data ^Angstrom---erc712Hasher
+                - `TypedDataHasherLib.init(_domainSeparator());`
+                    - `_domainSeparator` -- from solady
+                    - .init 
+                        - 0x40 -- free memory pointer
+                        - hasher := mload(0x40) -- point to free memory
+                        - mstore(0x40, add(hasher, 0x42)) -- move free memory pointer 66 bytes right
+                        - mstore(hasher, hex"1901") -- according to EIP712 spec need to start with it
+                        - mstore(add(hasher, 2), separator) -- store 32 bytes right after our 0x1901 bytes
+                        - last 32 bytes are left untouched
+            - ToBOrderBuffer memory buffer; buffer.init();
+                - set buffer.typeHash to TopOfBlockOrder hash
+                - set buffer.validForBlock to block.number
+            - `_validateAndExecuteToBOrder` -- read data from calldata; validate signature; invalidateOrderHash (so no replay in the same tx); update deltas, get/send tokens ^Angstrom---validateAndExecuteToBOrder
+                - ToB -- TopOfBlock
+                - `(reader, variantByte) = reader.readU8(); variantMap = ToBOrderVariantMap.wrap(variantByte);` -- load 1 byte as map with 8 true/false flags (only 4 in use: useInternal, 0for1, hasRecipient, isEcdsa)
+                - set useInternal, quantityIn, quantityOut, maxGasAsset0
+                - validate gasUsedAsset0 > buffer.maxGasAsset0 -- both encoded by user/node
+                - [[#^Pair-get]]
+                - Pair.getAssets -- zeroToOne ? 01 : 10 ^Pair-getAssets
+                    - data is put in memory in [[#^Angstrom-unlockCallback--pairs]]
+                    - Stored in memory as  ![[#^Pair-readFromAndValidate--result]]
+                    - let offsetIfZeroToOne := shl(5, zeroToOne) -- zeroToOne ? 32bytes : 0
+                        - -- add 5 0s after 1 or 0; so 100000 or 0x0 => 32 vs 0 => 0x20 vs 0; so either 32 bytes offset or 0 offset.
+                    - assetIn := mload(add(self, xor(offsetIfZeroToOne, 0x20))) -- zeroToOne ? asset0 : asset1
+                        - add(self, xor(offsetIfZeroToOne, 0x20)) -- if zeroToOne read first 32 bytes, otherwise second 
+                            - self -- pointer to memory where Pair is encoded
+                            - xor(offsetIfZeroToOne, 0x20) -- invert: 0x0 for true, 0x1... for false
+                                - offsetIfZeroToOne -- 0x1... for true, 0x0 for false
+                                - 0x20 -- 32 => 100000
+                    - assetOut := mload(add(self, offsetIfZeroToOne)) -- zeroToOne ? asset1 : asset0
+                - (reader, buffer.recipient) = variantMap.recipientIsSome() ? reader.readAddr() : (reader, address(0)); -- hasRecipient ? read from calldata : 0  ^Angstrom---validateAndExecuteToBOrder--recipient
+                - bytes32 orderHash = typedHasher.hashTypedData(buffer.hash()); --k256(0x1901 + domainSeparator + buffer.hash())  ^Angstrom---validateAndExecuteToBOrder--orderHash
+                    - buffer.hash -- get k256 hash of buffer struct
+                        - orderHash := keccak256(self, BUFFER_BYTES) 
+                            - self -- buffer, pointer to the start of the struct
+                                - struct has length?  -- no
+                            - BUFFER_BYTES -- length of buffer (struct, 288 bytes, 9 words/vars)
+                    - TypedDataHasher.hashTypedData -- should be a unique hash for unique buffer + domain
+                        - mstore(add(hasher, 0x22), structHash) -- save hash of buffer struct in hasher + 34 bytes (result: 0x1901 + domainSeparator + buffer.hash())
+                            - add(hasher, 0x22) -- point to (possibly dirty) 32 bytes left of hasher
+                                - hasher -- pointer to [[#^Angstrom---erc712Hasher]]
+                                - 0x22 -- 34 bytes, 0x1901 + 32 bytes domainSeparator (keccak256)
+                            - structHash -- 32 bytes hash of buffer struct
+                        - digest := keccak256(hasher, 0x42) -- make a hash of `(0x1901_2 + domainSeparator_32 + buffer.hash()_32)` 66=0x42 bytes
+                - (reader, from) = variantMap.isEcdsa() -- verify signature; ecrecover or call1271  ^Angstrom---validateAndExecuteToBOrder--from
+                    - ? SignatureLib.readAndCheckEcdsa(reader, orderHash) -- recover, check for failure of ecrecover call
+                        - hash -- [[#^Angstrom---validateAndExecuteToBOrder--orderHash]]
+                        - `let free := mload(0x40) mstore(free, hash) // Ensure next word is clear mstore(add(free, 0x20), 0)` -- put has in free memory and add 32 bytes of 0s after
+                        - calldatacopy(add(free, 0x3f), reader, 65)  -- copy the signature from calldata to memory, after orderHash {orderHash32;0s31; |HERE|}
+                            - add(free, 0x3f) -- starting from last byte of 0s {orderHash32;0s31; |HERE|}
+                                - 0x3f = 63
+                            - reader --pointer to not yet read calldata
+                            - 65 -- it expects 65 bytes, the same as OZ. 
+                                - But should not it be 1 more byte for length? Probably packed, so no
+                        - reader := add(reader, 65) -- move past signature in calldata
+                        - from := mload(staticcall(gas(), ECRECOVER_ADDR, free, 0x80, 0x01, 0x20)) -- load `from` from 0x1 slot on success; from 0x0 on failure, but it will be handled later
+                            - staticcall(gas(), ECRECOVER_ADDR, free, 0x80, 0x01, 0x20) -- 0x1 on success, 0x0 on failure
+                                - > staticcall(gas, address, memStartIn, memLengthIn, memStartOut, memLengthOut)
+                                - read 128 bytes starting from free: {orderHash32; 0s31; signature65}
+                                - write to 0x01, 32 bytes
+                                - is `from := mload(staticcall(gas(), ECRECOVER_ADDR, free, 0x80, 0x01, 0x20))` will store address correctly, 0 padded? Or how -- looks like it does
+                                    - how is it returned from ecdsa recover -- 0 padded on the left
+                                    - how is it stored in memory usually -- 0 padded on the left
+                    - : SignatureLib.readAndCheckERC1271(reader, orderHash); -- call `from` from calldata, make sure the call returns expected magicValueSig
+                        - read address from calldata
+                        - read signature from calldata
+                            - readBytes -- read signature from calldata (first length, then signature)
+                                - slice.length := shr(232, calldataload(self)) -- extends memory too probably
+                                    - shr(232, calldataload(self)) -- read first 3 bytes as length
+                                    - slice.length := -- increases/changes length
+                                        - it says read-only, hmm
+                                        - no, can write in test
+                                - self := add(self, 3) -- move reader
+                                - slice.offset := self -- it will be pointer to calldata, where the data is stored
+                        - isValidERC1271SignatureNowCalldata -- call return expected magicValueSig
+                            - let m := mload(0x40) -- pointer to free memory
+                            - let f := shl(224, 0x1626ba7e) -- right padded MAGIC_VALUE from EIP1271, `bytes4(keccak256("isValidSignature(bytes32,bytes)"))`. (function signature)
+                            - mstore(m, f) -- store the MagicValue at empty memory
+                            - mstore(add(m, 0x04), hash) -- store 32 bytes of hash after the magicValue=function selector
+                            - let d := add(m, 0x24) -- move 4 + 32 bytes to the right, after sig and hash
+                            - mstore(d, 0x40) // The offset of the `signature` in the calldata. -- store 0x40 (left-padded) there
+                            - mstore(add(m, 0x44), signature.length) -- move 68 bytes {magicSig4; hash32; offset32}, store length there
+                            - calldatacopy(add(m, 0x64), signature.offset, signature.length) -- move 100 bytes {magicValueSig4; hash32; offset32; sigLength32}; Copy signature there
+                            - isValid := and( -- call succeded and return value too
+                                - eq(mload(d), f), -- make sure it's the magicValueSig
+                                    - mload(d) -- read a word written in staticcall below
+                                    - f -- magicValueSig
+                                - staticcall(gas(), signer, m, add(signature.length, 0x64), d, 0x20) -- call signer.isValidSignature(hash, signature)
+                                    - signer -- `from`, read from calldata in `readAndCheckERC1271`
+                                    - m -- pointer to the start of our data filled above
+                                    - add(signature.length, 0x64) -- length of our calldata, from function signature `bytes4(keccak256("isValidSignature(bytes32,bytes)"))` until the end of the signature.
+                                        - -- {magicValueSig4; hash32; offset32; sigLength32} + signature.length
+                                        - 0x64=100;
+                                    - d -- write just after magicValueSig4 and hash32
+                                    - 0x20 -- length to write
+                - `_invalidateOrderHash` -- don't allow to use the same from+orderHash during the transaction ^OrderInvalidation---invalidateOrderHash
+                    - mstore(20, from) -- store address right-padded at 0x20 (32)
+                        - -- {20 dirty bytes; 32 bytes left padded address}
+                        - -- {20 dirty bytes; 12 0s; 20 bytes address; dirty bytes}
+                        - basically move address to the next slot, making it right-padded in the slot2
+                        - See test/EvaluationOrder.t.sol, `_invalidateOrderHashMock`
+                    - mstore(0, orderHash) -- store hash in 0x00
+                    - let slot := keccak256(0, 52) -- k256 hash32 + address20
+                    - if tload(slot) { -- if it was written before revert
+                    - tstore(slot, 1) -- store while the transaction exist
+                - to := or(mul(iszero(to), from), to) -- to ? to : from ^Angstrom---validateAndExecuteToBOrder--to
+                    - if 
+                        - `to` != 0 => `to`
+                            - left side == 0
+                            - or will return `to`
+                        - `to` == 0 => `from`; 
+                    - mul(iszero(to), from),  --  to == 0 ? from : 0
+                        - -- !to ? from : 0 =>
+                        - iszero(to) -- buffer.recipient => can be 0 or set in calldata
+                        - from -- from signature
+                    - to -- buffer.recipient => can be 0 or set in calldata
+                - `if (variantMap.zeroForOne()) { buffer.quantityIn += gasUsedAsset0; } else { buffer.quantityOut -= gasUsedAsset0; }` -- either request to pay more assetIn for gas or get less assetOut. Not on top, but from requested values
+                    - 0 for 1, buy token1, sell token0. Set how much token0 (sell)
+                    - 1 for 0, buy token 0, sell token1. Set how much token0 (buy)
+                - `_settleOrderIn` -- add to deltas, get from `from` ^Settlement---settleOrderIn
+                    - uint256 amount = amountIn.into(); -- just unwrap no uint
+                    - bundleDeltas.add(asset, amount); -- make asset surplus
+                    - `if (useInternal) { _balances[asset][from] -= amount;` -- if set flag to use internal reduce internal balance
+                    - else { asset.safeTransferFrom(from, address(this), amount); -- else use transfer `from`
+                - `_settleOrderOut` -- sub from deltas, send to `from` ^Settlement---settleOrderOut
+        - `_validateAndExecuteUserOrders` -- same
+            - Mostly the same as [[#^Angstrom---validateAndExecuteToBOrder]]
+            - [[#^Angstrom---erc712Hasher]]
+            - `_validateAndExecuteUserOrder`
+                - UserOrderBuffer.init -- set refId, typeHash, useInternal
+                    - `variantMap := byte(0, calldataload(reader)) reader := add(reader, VARIANT_MAP_BYTES)` -- read the leftmost byty, move reader 1 byte
+                    - calldatacopy -- copy 4 bytes from reader to uint32 refId
+                        - add(self, add(REF_ID_MEM_OFFSET, sub(0x20, REF_ID_BYTES))) -- move 60 bytes from the start of the struct, 4 bytes (32 bit) before the end of 32 bytes word for `uint32 refId;`
+                            - self, -- start of the struct
+                            - add(REF_ID_MEM_OFFSET, sub(0x20, REF_ID_BYTES)) -- 32 + 28 = 60 bytes = 0x3C
+                                - REF_ID_MEM_OFFSET -- 0x20=32
+                                - sub(0x20, REF_ID_BYTES) -- 28 bytes
+                                    - 0x20 --32 bytes
+                                    - REF_ID_BYTES -- 4bytes
+                        - reader -- pointer to calldata
+                        - REF_ID_BYTES -- 4 bytes = 32 bit
+                    - reader := add(reader, REF_ID_BYTES) -- move reader 4 bytes
+                    - `if (variantMap.quantitiesPartial()) {`... -- set .typeHash
+                    - set .useInternal
+                - (reader, pairIndex) = reader.readU16(); -- get pairIndex (number), move reader
+                - pairs.get(pairIndex).getSwapInfo(variantMap.zeroForOne()) -- load `{a0;a1;...}` from memory; load price, fee, calculate `{...priceMinusFee}
+                    - [[#^Pair-get]]
+                    - Pair.getSwapInfo -- get asset0, asset1, fee, price from memory; return {a0;a1;priceMinusFee}
+                        - memory from self:
+                            - ![[#^Pair-readFromAndValidate--result]]
+                        - self -- pointer to memory with pair data
+                        - zeroToOne -- was set in mapping
+                        - offsetIfZeroToOne, assetIn, assetOut exactly as in [[#^Pair-getAssets]]
+                        - `priceOutVsIn := mload(add(self, add(PAIR_PRICE_0_OVER_1_OFFSET, offsetIfZeroToOne)))` -- load a word on self + 5or4 slots => price1Over0 or price0Over1
+                            - `add(self, add(PAIR_PRICE_0_OVER_1_OFFSET, offsetIfZeroToOne))` -- offset: zeroToOne ? self + 5x32 : self + 4x32
+                                - `self` -- see [[#^Pair-get]]
+                                - `add(PAIR_PRICE_0_OVER_1_OFFSET, offsetIfZeroToOne)` -- offset: zeroToOne ? 5x32 : 4x32 bytes
+                                    - `PAIR_PRICE_0_OVER_1_OFFSET` -- 0x80, 4 slots
+                                    - `offsetIfZeroToOne` -- zeroToOne ? 32 : 0; 1 slot or 0 slots
+                        - `oneMinusFee := sub(ONE_E6, mload(add(self, PAIR_FEE_OFFSET)))` -- 1e6 - fee
+                            - `sub(ONE_E6, mload(add(self, PAIR_FEE_OFFSET)))` -- 100% - fee%
+                                - `ONE_E6` -- 1e6
+                                - `mload(add(self, PAIR_FEE_OFFSET))` -- load
+                                    - `add(self, PAIR_FEE_OFFSET)` -- 3 slots offset after self => feeInE6; see [[#^Pair-readFromAndValidate--result]]
+                                        - `self` -- see [[#^Pair-get]]
+                                        - `PAIR_FEE_OFFSET` -- 0x60, 3 slots
+                        - `priceOutVsIn = priceOutVsIn * oneMinusFee / ONE_E6;` -- price minus fee
+                            - priceOutVsIn -- price1Over0 or price0Over1
+                            - oneMinusFee -- e.g. 99% if fee is 1%
+                            - / ONE_E6 -- /100%
+                - if (price.into() < buffer.minPrice) revert LimitViolated(); -- if the price we got is < min revert
+                - `(reader, buffer.recipient) = variantMap.recipientIsSome() ? reader.readAddr() : (reader, address(0));`
+                    - ![[#^Angstrom---validateAndExecuteToBOrder--recipient]]
+                - (reader, hook, buffer.hookDataHash) = HookBufferLib.readFrom(reader, variantMap.noHook()); -- read and pack  {memPtrToContent_8; addr_20; payloadLength_4}; on memPtrToContent is {hook_4; 0s_28; dirty_4; 0x40_32; 0s_12};; On `noHookToRead == true` return (empty hook, k256("")) ^HookBufferLib-readFrom
+                    - reader -- calldata pointer
+                    - variantMap.noHook() -- set by node/user in byte
+                    - if iszero(noHookToRead) { -- `== if(hook)`;; no hook => return empty hash
+                        - hook true/false
+                        - noHook true => !hook; false => hook
+                        - iszero(noHook): true => hook; false => !hook
+                        - the same as `if(hook)`
+                    - `let hookDataLength := shr(232, calldataload(reader)) reader := add(reader, 3)` -- load length, 3 bytes; move reader in calldata
+                    - let memPtr := mload(0x40) -- free memory
+                    - let contentOffset := add(memPtr, sub(0x64, 20)) -- 100-20=80=0x50
+                    - mstore(0x40, add(contentOffset, hookDataLength)) -- reserve {contentOffset_80; hookData_length}; move free pointer after
+                    - calldatacopy(contentOffset, reader, hookDataLength) -- copy to memory after `contentOffset`
+                    - hash := keccak256(contentOffset, hookDataLength) -- get hash of hookData (hookAddr + payload)
+                    - reader := add(reader, hookDataLength) -- move reader
+                    - `let hookAddr := shr(96, mload(add(memPtr, add(0x44, 12))))` -- load first 20 bytes of hookData as address, save as it should, left padded
+                        - `shr(96, mload(add(memPtr, add(0x44, 12))))`-- add 12 bytes, so we have address padded on left
+                            - `96` 
+                            - `mload(add(memPtr, add(0x44, 12)))` -- load 32bytes starting from hookData
+                                - `add(memPtr, add(0x44, 12))` -- move 80 bytes, exactly as contentOffset
+                                    - `memPtr` -- our data: {content; hookData;...}
+                                    - `add(0x44, 12)` -- 68 + 12 bytes
+                                        - `0x44` -- 68 bytes
+                                        - `12` -- 12 bytes
+                    - mstore(memPtr, HOOK_SELECTOR_LEFT_ALIGNED) // 0x00:0x04 selector -- store selector on content; first 4 out of 80 bytes
+                        - memPtr now: `{(hook_4; 0s_28; dirty_48)_80; hookData(addr_20; data...)_X }`
+                    - mstore(add(memPtr, 0x24), 0x40) // 0x24:0x44 calldata offset -- store 0x40 {selector_4; dirty_32; 0x40_32; dirty_12}
+                        - add(memPtr, 0x24) -- move 36 bytes
+                        - 0x40
+                        - memPtr now: `{(hook_4; 0s_28; dirty_4; (0s_31, 0x40_1)_32; dirty_12)_80; hookData(addr_20; data...)_X }`
+                    - let payloadLength := sub(hookDataLength, 20) -- hookData {addr_20; payload..}
+                    - mstore(add(memPtr, 0x44), payloadLength) // 0x44:0x64 payload length
+                        - 0x44 = 68
+                        - it will overwrite hookAddress
+                        - memPtr now: `{hook_4; 0s_28; dirty_4; (0s_31, 0x40_1)_32; payloadLength_32; hookData(data...)_X }`
+                        - or: `{hook_4; 0s_28; dirty_4; 0x40_32; 0s_12; v_hookDataPtr_v payloadLength_20; hookDataData_X }`
+                    - `hook := or(shl(HOOK_MEM_PTR_OFFSET, memPtr), or(shl(HOOK_ADDR_OFFSET, hookAddr), add(payloadLength, 0x64)))`-- pack data, result is  {memPtr_8; addr_20; payloadLength_4}
+                        - `shl(HOOK_MEM_PTR_OFFSET, memPtr)` -- remove all but last 64 bits; pack memPtr
+                            - `HOOK_MEM_PTR_OFFSET` -- 192
+                            - `memPtr`
+                            - {memPtr_8; 0s_24}
+                        - `or(shl(HOOK_ADDR_OFFSET, hookAddr), add(payloadLength, 0x64))` -- probably pack payloadLength in the last 4 bytes: {0s_8; addr_20; payloadLength_4}
+                            - `shl(HOOK_ADDR_OFFSET, hookAddr)` -- remove first 4 bytes (0s) from hook addr for some reason
+                                - `HOOK_ADDR_OFFSET` -- 32 bits
+                                - `hookAddr` 
+                                - {0s_8; addr_20; 0s_4}
+                            - `add(payloadLength, 0x64)` -- add 2 slots
+                                - `payloadLength` -- hookData - address_20
+                                - `0x64`
+                    - return {reader: after hook data; hook: see above; hash: k256(hookAddr + payload)}; Note: hook is 0, hash is k256("") on `variantMap.noHook()==true`
+                - reader = buffer.readOrderValidation(reader, variantMap); -- load from calldata nonce_or_validForBlock and deadline_or_empty
+                    - `calldatacopy(add(self, add(NONCE_MEM_OFFSET, sub(0x20, NONCE_BYTES))), reader, NONCE_BYTES)` -- write to self+11x32+24; from reader; 8 bytes; 
+                        - `add(self, add(NONCE_MEM_OFFSET, sub(0x20, NONCE_BYTES)))` -- move 11 words + 24 bytes from self
+                            - `self` -- UserOrderBuffer struct pointer
+                            - `add(NONCE_MEM_OFFSET, sub(0x20, NONCE_BYTES))` -- 0x160 + 24bytes
+                                - `NONCE_MEM_OFFSET` -- 0x160, 11 words
+                                - `sub(0x20, NONCE_BYTES)` -- 32-8 = 24 bytes
+                                    - `0x20` -- 1 word
+                                    - `NONCE_BYTES` -- 8
+                        - `reader` -- calldata pointer
+                        - `NONCE_BYTES` -- 8
+                    - `reader := add(reader, NONCE_BYTES)` -- move reader 8 bytes
+                    - `calldatacopy(add(self, add(DEADLINE_MEM_OFFSET, sub(0x20, DEADLINE_BYTES))), reader, DEADLINE_BYTES)` -- write to .deadline_or_empty from calldata
+                        - `add(self, add(DEADLINE_MEM_OFFSET, sub(0x20, DEADLINE_BYTES)))` -- pointer to UserOrderBuffer.deadline_or_empty
+                            - `self` -- UserOrderBuffer sturct
+                            - `add(DEADLINE_MEM_OFFSET, sub(0x20, DEADLINE_BYTES))` -- 12 words + 27bytes
+                                - `DEADLINE_MEM_OFFSET` -- 0x180 = 12 words
+                                - `sub(0x20, DEADLINE_BYTES)` -- start 5 bytes from the end of word
+                                    - `0x20` 
+                                    - `DEADLINE_BYTES` -- 5
+                        - `reader`
+                        - `DEADLINE_BYTES` -- 5
+                    - `reader := add(reader, DEADLINE_BYTES)` -- move reader
+                - (reader, amountIn, amountOut) = buffer.loadAndComputeQuantity(reader, variantMap, price); -- read from calldata to buffer. + compute quantity in/out
+                    - variant.quantitiesPartial() -- 2 order types, Partial and Exact: quantity vs min+max+filled
+                        - code
+                            ```enum OrderQuantities {
+                                Exact {
+                                    quantity: u128
+                                },
+                                Partial {
+                                    min_quantity_in: u128,
+                                    max_quantity_in: u128,
+                                    filled_quantity: u128
+                                }
+                            }
+                            ```
+                    - if (variant.quantitiesPartial()) { -- reada write min,max,filled; make sure filled >=min; <=max; write min and max
+                    - } else { -- write exactIn(true/false) and quantint
+                        - variant.exactIn() -- switch, read quantity as exactIn or as exactOut
+                        - exactIn_or_minQuantityIn -- exactIn: write 1 for exactIn, false for exactOut
+                        - quantity_or_maxQuantityIn -- quantity 
+                    - if (extraFeeAsset0 > maxExtraFeeAsset0) revert GasAboveMax(); -- make sure node set value as user allowed
+                        - maxExtraFeeAsset0 --  should come from user-provided value
+                        - extraFeeAsset0 --  set by node
+                        - see docs/overview.md### Node vs. Users
+                    - if (variant.zeroForOne()) {  
+                        - -- left to right or right to left swap
+                        - variant.specifyingInput() -- did user set input or output
+                        - if (variant.specifyingInput()) { -- in from input, out calculated; fee subtracted from output
+                            - quantityIn is written from quantity
+                            - quantityOut is calculated as `quantityInMinusFee x price`
+                        - else -- out from input, in calculated; fee added to input;
+                    - else -- 1 => 0
+                        - if (variant.specifyingInput()) { -- in from user, out calculated, fee from out
+                        - else -- out from user, in calculated, fee from in
+                    - Summary for quantityIn, quantityOut -- get one from the user input, calculate the other one, subtract fee from calculated one;
+                    - write from calldata `buffer.exactIn_or_minQuantityIn`, `buffer.quantity_or_maxQuantityIn`;  - `maxExtraFeeAsset0`
+                - bytes32 orderHash = typedHasher.hashTypedData(buffer.structHash(variantMap)); --   [[#^Angstrom---validateAndExecuteToBOrder--orderHash]]
+                    - buffer.structHash(variantMap) -- hash order; if `!isStanding` type skip deadline_or_empty
+                        - variant.isStanding() -- valid for several blocks
+                        - standing order has deadline_or_empty, while regular one does not
+                - [[#^Angstrom---validateAndExecuteToBOrder--from]]
+                - if (variantMap.isStanding()) { -- valid for several blocks
+                    - `_checkDeadline(buffer.deadline_or_empty);` -- revert next second after deadline; on deadline is ok
+                    - `_invalidateNonce` -- Each 256 nonces get a slot. it's like 256 bits, and set true/false if used or not
+                        - `...` is dirty
+                        - nonce 8 bytes => 64 bits
+                        - mstore(12, nonce) -- bytes: {dirty_12; 0s_24; nonce_8; ...}
+                        - mstore(4, UNORDERED_NONCES_SLOT) -- bytes:{dirty_4; 0s_28; UNoncesSlot_4; nonce_8; ...}
+                        - mstore(0, owner) -- bytes: {0s_12; owner_20; UNoncesSlot_4; nonce_8; ...}
+                        - let bitmapPtr := keccak256(12, 31) -- hash bytes:{owner_20; UNoncesSlot_4; nonce_7}; {ignores last nonce byte}
+                        - let flag := shl(and(nonce, 0xff), 1) -- 1 << {0; 255}; so in binary which slot set to 1
+                            - and(nonce, 0xff), -- get last byte
+                                - nonce -- uint64
+                                - 0xff -- last 8 bits = last byte
+                        - let updated := xor(sload(bitmapPtr), flag) -- true if some bit 0->1 or 1->0
+                            - sload(bitmapPtr) -- load slot generated uniquely for owner and nonce (simplified)
+                            - flag -- see above
+                        - if iszero(and(updated, flag)) { -- no changes from 0 to 1 => revert
+                            - and(updated, flag) -- if something is changed from 0 to 1 => true
+                                - updated --  256 0s and 1s; one of them possibly set to 1
+                                - flag -- 256 01s; one of them is 1
+                                - -- if the value is both 1 now and updated
+                        - sstore(bitmapPtr, updated) -- store changed bits between last and current nonce;  bits: {0s_247; possibleData_8; 0s_1}
+                            - updated 
+                                - is xor of last value and the current nonce last byte
+                                - so basically changes
+                        - Summary: for each 256 nonces we have the same slot. We use last byte as index of bit in uin256 true/false arrau; we can only set from 0 to 1 or it will revert
+                - else -- flash order, 1 block; [[#^OrderInvalidation---invalidateOrderHash]]
+                - [[#^Angstrom---validateAndExecuteToBOrder--to]]
+                - [[#^Settlement---settleOrderOut]]
+                - hook.tryTrigger(from) -- call from with specified data, revert on failure
+                    - hook -- [[#^HookBufferLib-readFrom]]
+                        - self -- {memPtrToContent_8; addr_20; payloadLength_4}
+                        - on memPtrToContent is {hook_4; 0s_28; dirty_4; 0x40_32; 0s_12}
+                    - if self { -- !hook => noop;
+                    - let calldataLength := and(self, HOOK_LENGTH_MASK) -- read last 4 bytes as calldataLength
+                        - self
+                        - HOOK_LENGTH_MASK -- 0xffffffff -> last 4 bytes
+                    - let memPtr := shr(HOOK_MEM_PTR_OFFSET, self) -- {0s_24; memPtrToContent_8}
+                        - self
+                        - HOOK_MEM_PTR_OFFSET -- 192 bits => 24 bytes
+                    - `mstore(add(memPtr, 0x04), from)` -- new state =={hook_4; 0s_12; from_20; 0x40_32; 0s_12}== ^HookBuffer-tryTrigger--new-state
+                        - `add(memPtr, 0x04)` -- start to write {hook_4; (v_HERE_v) 0s_28; dirty_4; 0x40_32; 0s_12}
+                            - `memPtr` -- see above
+                            - `0x04` -- 4 bytes
+                        - `from`
+                    - let hookAddr := shr(HOOK_ADDR_OFFSET, self) -- {0s_4; memPtrToContent_8; addr_20} is address
+                        - HOOK_ADDR_OFFSET -- 32 bits = 4 bytes
+                        - self -- still the same as in the start of the function
+                    - let success := call(gas(), hookAddr, 0, memPtr, calldataLength, 0x00, 0x20) -- call hook, store first 32 bytes of the response
+                        - memPtr -- pointer to memPtrToContent, see [[#^HookBuffer-tryTrigger--new-state]]
+                        - calldataLength -- payloadLength
+                        - store 0x00, first 0x20(32) bytes
+                    - `iszero(and(success, and(gt(returndatasize(), 31), eq(mload(0x00), EXPECTED_HOOK_RETURN_MAGIC))))` -- the call failed or returned a wrong value => revert
+                        - `and(success, and(gt(returndatasize(), 31), eq(mload(0x00), EXPECTED_HOOK_RETURN_MAGIC)))` -- call was successful && first 32 bytes == EXPECTED_HOOK_RETURN_MAGIC
+                            - `success` -- call too hook was successful
+                            - `and(gt(returndatasize(), 31), eq(mload(0x00), EXPECTED_HOOK_RETURN_MAGIC))` -- returned >=32 bytes && first 32 bytes is EXPECTED_HOOK_RETURN_MAGIC
+                                - `gt(returndatasize(), 31)`  -- return >=32 bytes
+                                - `eq(mload(0x00), EXPECTED_HOOK_RETURN_MAGIC)` -- did it return expected magic
+                                    - `mload(0x00)` -- where we stored the answer
+                                    - `EXPECTED_HOOK_RETURN_MAGIC` -- `keccak256("Angstrom.hook.return-magic")[-4:]`
+                    - `mstore(0x00, 0xf959fdae /* InvalidHookReturn() */ ) revert(0x1c, 0x04)`
+                        - skip first 28 bytes, revert with 0xf959fdae
+                - [[#^Settlement---settleOrderIn]]
+        - reader.requireAtEndOf(data); -- make sure we read all the calldata
+            - data -- from UniV4, user-provided
+            - data.offset -- {selector_4; pointers/lengthes...; v_data.offset_v}
+            - if iszero(eq(self, end)) { -- self != end => revert
+        - `_saveAndSettle(assets);` -- for each asset verify delta exactly right, send funds to UniV4, emit hash of all (b20:addr ++ b16:save)
+            - assets -- [[#^Angstrom-unlockCallback--assets]]
+            - fee entry (b20:addr ++ b16:save)
+                - raw_copyFeeEntryToMemory will copy address + save, 36 bytes
+            - uint256 length = assets.len(); -- get last 4 bytes, length
+            - `raw_feeSummaryStartPtr := mload(0x40);; mstore(0x40, add(raw_feeSummaryStartPtr, mul(length, FEE_SUMMARY_ENTRY_SIZE)))` -- move free memory pointer after fee_summaries (not yet filled)
+                - `0x40` -- empty slot pointer update
+                - `add(raw_feeSummaryStartPtr, mul(length, FEE_SUMMARY_ENTRY_SIZE))` 
+                    - `raw_feeSummaryStartPtr` -- start of free memory
+                    - `mul(length, FEE_SUMMARY_ENTRY_SIZE)` -- length of fee summaries
+                        - `length` -- number of assets
+                        - `FEE_SUMMARY_ENTRY_SIZE` -- 36 bytes
+            - if (bundleDeltas.sub(addr, saving + settle) != 0) { -- if deltas not as expected => revert
+                - addr -- asset address
+                - saving + settle -- network fees + to send to UniV4
+                    - saving = asset.save(); -- from calldata ^Asset-save
+                        - >Amount of the asset to save as the network fee
+                        - >The `save` amount determines the total in gas, exchange & referral fees to be committed to for later collection. Exchange fees are computed by the pair's `fee_in_e6`. Note that `save` only includes the amount to be distributed to nodes, LP fees are attributed within the bundle via pool updates.
+                    - settle = asset.settle(); -- from calldata ^Asset-settle
+                        - >Final amount to be repayed to Uniswap post-bundle execution
+                        - >The `settle` amount is the total in liquid tokens to be paid to Uniswap to repay borrows as well as pay for the input side of pool swaps.
+            - if (settle > 0) { -- if need to send some to Univ
+                - [[#^Asset-settle]] -- send to UniV4, trigger state update in UniV4
+                    - `UNI_V4.sync(_c(addr));` -- update balanceOf and currency in tstore
+                        - `_c(addr)` -- just Currency.wrap
+                        - sync -- update balanceOf and currency in tstore
+                            - tstore(CURRENCY_SLOT, and(currency, 0xffffffffffffffffffffffffffffffffffffffff)) -- currency is `_c(addr)`
+                            - tstore(RESERVES_OF_SLOT, value)  -- balanceOf(UniV4)
+                                - `IERC20Minimal(Currency.unwrap(currency)).balanceOf(address(this));` 
+                                - or `address(this).balance;` for ETH
+                    - addr.safeTransfer(address(UNI_V4), settle); -- send amount to UniV4
+                    - UNI_V4.settle(); -- update deltas on amount sent
+            - asset.raw_copyFeeEntryToMemory(raw_feeSummaryPtr); -- copy from calldata to memory
+                - calldatacopy(raw_memOffset, add(self, ADDR_OFFSET), FEE_SUMMARY_ENTRY_SIZE) -- copy from calldata to memory
+                    - raw_memOffset -- raw_feeSummaryPtr => pointer to the feeSummaryEntry in memory (not yet filled)
+                    - add(self, ADDR_OFFSET) -- starting from asset position in calldata
+                    - FEE_SUMMARY_ENTRY_SIZE -- 68 bytes (b20:addr ++ b16:save ++ b16:borrow ++ b16:settle)
+            - raw_feeSummaryPtr += FEE_SUMMARY_ENTRY_SIZE; -- move the pointer to the next write position, next element
+            - `mstore(0x00, keccak256(raw_feeSummaryStartPtr, mul(length, FEE_SUMMARY_ENTRY_SIZE)))` -- just emit has of all the fee entries
+                - `0x00` -- at slot 0x00, scratch space
+                - `keccak256(raw_feeSummaryStartPtr, mul(length, FEE_SUMMARY_ENTRY_SIZE))` -- hash
+                    - `raw_feeSummaryStartPtr` -- start of the fee entries in memory
+                    - `mul(length, FEE_SUMMARY_ENTRY_SIZE)` -- length of all the fee entries
+                        - `length`
+                        - `FEE_SUMMARY_ENTRY_SIZE`
+        - return empty bytes
+    - Qs
+        - How is the data passed through UniV4? Is it user provided? 
+            - See [[#^Angstrom-unlockCallback--pics]]
+            - User -> node; node -> Angstrom.execute -> UniV4.unlock -> Angstrom.unlockCallback
+            - User -> Router -> add/remove liquidity -> ok
+            - User -> Router -> swap -> will revert, hook beforeSwap does not exist
+        - pool == pair in `_updatePool`? -- yep, iirc
+        - Memory allocation when accessing a memory slot far-far away? -- you pay for all the slots before too
+            - https://learnevm.com/chapters/evm/memory#memory-expansion
+- PoolUpdates
+    - beforeAddLiquidity -- initialize tick rewards, calculate growthInside, adjust growth to make sure no new rewards are added (in theory) ^PoolUpdates-beforeAddLiquidity
+        - > /// @dev Maintain reward growth & `poolRewards` values such that no one's owed rewards change.
+        - sender -- caller of `beforeModifyLiquidity` <- UniV4.beforeModifyLiquidity(msg.sender) <- modifyLiquidity(msg.sender) ^PoolUpdate-beforeAddLiquidity--sender
+        - params.salt -- in case someone have several exactly the same positions ^PoolUpdate-beforeAddLiquidity--salt
+        - lowerGrowth -- growth on the left side of liquidity range
+        - upperGrowth -- on the right side
+        - if (currentTick < params.tickLower) { -- {currentTick...<Lower...Upper>...}
+            - growthInside = lowerGrowth - upperGrowth; -- formula from unis
+        - } else if (params.tickUpper <= currentTick) { -- {...<Lower...Upper>...currentTick...} or {...<Lower...Upper=currentTick>...} 
+            - if (lower not initialized) -- set to global
+                - `rewards.rewardGrowthOutside[uint24(params.tickLower)] = lowerGrowth = rewards.globalGrowth;`
+                    - initialize to global, maximum
+        - else -- between ticks
+        - Summary ^PoolUpdates--growthInsideFormula
+            - C...L...U 
+                - => Lg - Ug
+                - => no init
+            - L...U...C or L...U=C
+                - => Ug - Lg
+                - => init both; 
+            - L...C...U or L=C...U
+                - => Gg - Lg -Ug
+        - positions.get(id, sender, params.tickLower, params.tickUpper, params.salt) -- load from self storage
+            - id -- pool id from key, same as on uniV4
+            - sender -- [[#^PoolUpdate-beforeAddLiquidity--sender]]
+            - salt -- [[#^PoolUpdate-beforeAddLiquidity--salt]]
+            - mstore(0x06, upperTick) -- {0s_6; 0s_29; upper_3}
+            - mstore(0x03, lowerTick) --  {0s_3; 0s_29; lower_3; upper_3}
+            - mstore(0x00, owner) -- {0s_12; owner_20; lower_3; upper_3}
+            - mstore(0x26, salt) -- 38;  {0s_12; owner_20; lower_3; upper_3; salt_32}
+            - `positionKey := keccak256(12, add(add(3, 3), add(20, 32)))` -- k256 data
+                - `12` -- start from data, skip first 12 0s
+                - `add(add(3, 3), add(20, 32))` -- 3+3+20+32 = 58; all the data length
+                    - `add(3, 3)` -- lower + upper
+                    - `add(20, 32)` -- salt + owner
+            - `position = self.positions[id][positionKey];` --  get position by key and id
+        - uint128 lastLiquidity = UNI_V4.getPositionLiquidity(id, positionKey); -- load `pools[id].positions[positionKey]`, decode liquidity from it ^UniV4-getPositionLiquidity
+            - `mstore(0x20, _POOLS_SLOT)` -- 6; 
+            - mstore(0x00, id) -- {id_20; 0s_31; poolSlot_1}
+            - `mstore(0x20, add(keccak256(0x00, 0x40), _POOL_STATE_POSITIONS_OFFSET))` -- compute slot for `pools[id][wordPos]`
+                - `0x20`
+                - `add(keccak256(0x00, 0x40), _POOL_STATE_POSITIONS_OFFSET)`
+                    - `keccak256(0x00, 0x40)` -- hash of poolId and poolSlot
+                        - see [[#^IUniV4-computeBitmapWordSlot]]
+                    - `_POOL_STATE_POSITIONS_OFFSET`
+            - mstore(0x00, positionKey) mstore(0x20, keccak256(0x00, 0x40)) -- compute slot for `pools[id].positions[key]`
+            - mstore(0x00, EXTSLOAD_SELECTOR) -- {0s_28; extsloadSelector_4; slot_32}
+            - iszero(staticcall(gas(), self, 0x1c, 0x24, 0x00, 0x20)) -- if slot is 0 revert
+                - staticcall(gas(), self, 0x1c, 0x24, 0x00, 0x20) -- call UniV4.extsload(slot); store to 0x00
+            - liquidity := and(0xffffffffffffffffffffffffffffffff, mload(0x00)) -- get last 32 bits as liquidity
+        - uint128 liquidityDelta = uint128(uint256(params.liquidityDelta));
+            - params.liquidityDelta -- user provided. Can't be > type(uint128).max; Reverts in uniV4
+        - uint128 newLiquidity = lastLiquidity + liquidityDelta; -- can't overflow, checked in UniV4
+        - `if (lastLiquidity == 0) { position.lastGrowthInside = growthInside; `-- if a new position (liquidity was 0) set growthInside to calculated above
+        - `uint256 lastGrowthAdjustment = FixedPointMathLib.fullMulDiv(growthInside - position.lastGrowthInside, lastLiquidity, newLiquidity)` --  diffInGrowth x last / new => part of the growth for the previous liquidity; Adjustment to keep the same rewards with new liquidity
+            - `growthInside - position.lastGrowthInside` -- diff in growth
+            - `lastLiquidity`
+            - `newLiquidity`
+            - comments
+                - GPT
+                    - // Variable meanings:
+                    - // growth_inside: Current accumulated rewards per unit of liquidity (current value)
+                    - // last: Previous lastGrowthInside value stored in the position
+                    - // last': New lastGrowthInside value we want to calculate
+                    - // L: Previous liquidity amount (lastLiquidity)
+                    - // L': New liquidity amount after adding more (newLiquidity)
+                    - //
+                    - // To preserve existing rewards when updating lastGrowthInside:
+                    - // 1. Old rewards = (growth_inside - last) * L
+                    - // 2. New rewards should equal old rewards with new liquidity L'
+                    - // 3. Therefore: (growth_inside - last') * L' = (growth_inside - last) * L
+                    - // 4. Solve for last' to get the adjustment formula below
+                - `// (growth_inside - last') * L' = (growth_inside - last) * L`  -- growedDiffCurrent x newLiquidity = growedDiffCached x liquidityCached
+                    - growth_inside -- current growth per unit of L
+                    - last' -- lastGrowthInside (new, to calculate)
+                    - L' -- newLiquidity
+                    - last -- lastGrowthInside (current)
+                    - L -- lastLiquidity
+                - //  growth_inside - last' = (growth_inside - last) * L / L' 
+                - // last' = growth_inside - (growth_inside - last) * L / L' -- lastGrowthInsideNew = growthInsideCurrent - (growedDiffCached x newLsPerOldLs) 
+        - What if ticks are equal? Probably checked on uniV4 that it's not? -- yep, in `checkTicks`
+    - beforeRemoveLiquidity -- on growthDiff give rewards for the user ^PoolUpdates-beforeRemoveLiquidity
+        - `uint256 growthInside = poolRewards[id].getGrowthInside(currentTick, params.tickLower, params.tickUpper);` -- See [[#^PoolUpdates--growthInsideFormula]], same logic
+        - [[#^UniV4-getPositionLiquidity]]
+        - `uint256 rewards = X128MathLib.fullMulX128(growthInside - position.lastGrowthInside, positionTotalLiquidity)` -- growthDiff x L / 2^128 
+        - UNI_V4.sync(key.currency0); -- tstore current balances; logic is {sync; send; settle}; settle will give diff for the user
+            - docs
+                ```
+                /// @notice Writes the current ERC20 balance of the specified currency to transient storage
+                /// This is used to checkpoint balances for the manager and derive deltas for the caller.
+                /// @dev This MUST be called before any ERC20 tokens are sent into the contract, but can be skipped
+                /// for native tokens because the amount to settle is determined by the sent value.
+                /// However, if an ERC20 token has been synced and not settled, and the caller instead wants to settle
+                /// native funds, this function can be called with the native currency to then be able to settle the native currency
+                ```
+        - Currency.unwrap(key.currency0).safeTransfer(address(UNI_V4), rewards);
+        - UNI_V4.settleFor(sender); -- update delta for `sender`
+        - position.lastGrowthInside = growthInside; -- update, because we paid. Next time payment from only above growthInside
