@@ -138,7 +138,7 @@ const videoExtensionRegex = new RegExp(/\.(mp4|webm|ogg|avi|mov|flv|wmv|mkv|mpg|
 const wikilinkImageEmbedRegex = new RegExp(
   /^(?<alt>(?!^\d*x?\d*$).*?)?(\|?\s*?(?<width>\d+)(x(?<height>\d+))?)?$/,
 )
-const BLOCK_LINK_PREFIX = "__"
+const BLOCK_LINK_PREFIX = ""
 
 export const ObsidianFlavoredMarkdown: QuartzTransformerPlugin<Partial<Options>> = (userOpts) => {
   const opts = { ...defaultOptions, ...userOpts }
@@ -199,7 +199,7 @@ export const ObsidianFlavoredMarkdown: QuartzTransformerPlugin<Partial<Options>>
           const [fp, anchor] = splitAnchor(`${rawFp ?? ""}${rawHeader ?? ""}`)
           const blockRef = Boolean(rawHeader?.match(/^#?\^/)) ? BLOCK_LINK_PREFIX : ""
           const displayAnchor = anchor ? `#${blockRef}${anchor.trim().replace(/^#+/, "")}` : ""
-          const displayAlias = rawAlias ?? rawHeader?.replace("#", "|") ?? ""
+          const displayAlias = (rawAlias ?? rawHeader?.replace("#", "|") ?? "").replace(/`/g, '&#96;')
           const embedDisplay = value.startsWith("!") ? "!" : ""
 
           if (rawFp?.match(externalLinkRegex)) {
