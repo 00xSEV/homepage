@@ -17,8 +17,8 @@ lastmod: 2024-11-29
         - check if it's whitelisted msg.sender, and not called this block
     - unlockCallback -- called by UniV4 on execute; All the logic is here
         - pics ^Angstrom-unlockCallback--pics
-            - ![[static/20241107090046.png]]
-            - ![[static/20241107090121.png]]
+            - ![[20241107090046.png]]
+            - ![[20241107090121.png]]
             - From https://www.uint32.xyz/writing/uniswap-v4-lock-and-callback-mechanism
         - called by uniswap
             - on Angstrom.execute

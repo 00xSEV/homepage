@@ -975,7 +975,7 @@ Proxy=Storage contract
 				- `dy = dx * y / (x + dx)` -- last on the screenshot
 				- https://www.youtube.com/watch?v=EIIfavUFnM4&t=718s -- too basic
 				- https://www.youtube.com/watch?v=IL7cRj5vzEU -- good
-					- ![[static/Pasted image 20240719124652.png]]
+					- ![[Pasted image 20240719124652.png]]
 		- [[#^FlapperUniV2SwapOnly--sufficient-buy-amount]]
 		- `pair.swap(_amt0Out, _amt1Out, address(this), new bytes(0));` -- get MKR (DAI `transfer` just above)
 		- UniswapV2Pair.mint -- low-level mint, no returns
