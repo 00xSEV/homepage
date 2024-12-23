@@ -1,5 +1,6 @@
 ---
 title: Deep dive into Sorella Angstrom
+lastmod: 2024-11-29
 ---
 
 - Terms/symbols to read the post:

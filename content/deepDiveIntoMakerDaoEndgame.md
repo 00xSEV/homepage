@@ -1,5 +1,6 @@
 ---
 title: Deep dive into MakerDAO Endgame
+lastmod: 2024-08-09
 ---
 ## Lockstake
 ### Terms

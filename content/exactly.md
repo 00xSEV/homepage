@@ -1,4 +1,5 @@
 ---
+lastmod: 2024-08-31
 title: Exactly Protocol April 2024 Findings Review
 ---
 

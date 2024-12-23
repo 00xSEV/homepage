@@ -1,5 +1,6 @@
 ---
 title: Deep dive into Euler
+lastmod: 2024-06-24
 ---
 
 > Best viewed in Obsidian. [.md file](https://gist.githubusercontent.com/00xSEV/6a3029e51cfea29331bd25233fc6c564/raw/0270d5a66e043b9a48f8b68de637e9a2fb89694c/euler_notes.md)
