@@ -13,7 +13,33 @@ export const sharedPageComponents: SharedLayout = {
     },
   }),
 }
+const Explorer = Component.Explorer({
+  title: "Posts",
+  // based on quartz/components/Explorer.tsx
+  sortFn: (a, b) => {
+    // Sort order: folders first, then files. Sort folders and files alphabetically
+    if ((!a.file && !b.file) || (a.file && b.file)) {
+      return a.file?.dates?.modified && b.file?.dates?.modified
+        ? (a.file.dates.modified < b.file.dates.modified ? 1 : -1)
+        : 0
+    }
 
+    if (a.file && !b.file) {
+      return 1
+    } else {
+      return -1
+    }
+  },
+  mapFn: (node) => {
+    if (node.file?.dates?.modified) {
+      const date = new Date(node.file.dates.modified)
+      const month = date.toLocaleString('en', { month: 'short' })
+      const year = date.getFullYear().toString().slice(2)
+      node.displayName = `${node.displayName} (${month}'${year})`
+    }
+    return node
+  },
+});
 // components for pages that display a single page (e.g. a single note)
 export const defaultContentPageLayout: PageLayout = {
   beforeBody: [
@@ -27,12 +53,13 @@ export const defaultContentPageLayout: PageLayout = {
     Component.MobileOnly(Component.Spacer()),
     Component.Search(),
     Component.Darkmode(),
-    Component.DesktopOnly(Component.Explorer()),
+    Component.DesktopOnly(Explorer),
   ],
   right: [
     // Component.Graph(),
     Component.DesktopOnly(Component.TableOfContents()),
     // Component.Backlinks(),
+    Component.MobileOnly(Explorer)
   ],
 }
 
